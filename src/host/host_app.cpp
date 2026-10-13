@@ -14,6 +14,7 @@
 #include <chrono>
 #include <cstring>
 #include <cstdint>
+#include <cwchar>
 #include <thread>
 #include <utility>
 #include <winsock2.h>
@@ -124,6 +125,100 @@ public:
     void Request() { lastRequestTimestampMs_.store(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count(), std::memory_order_release); }
 };
 
+// Runs encoder rebuilds off the WebRTC callback thread. Requests that arrive while one is
+// pending (window drags, display mode changes) collapse into a single rebuild once they settle.
+class EncoderRebuildWorker {
+public:
+    explicit EncoderRebuildWorker(std::function<void(const char*)> rebuild)
+        : rebuild_(std::move(rebuild)), worker_([this] { Run(); }) {}
+    ~EncoderRebuildWorker() { Stop(); }
+
+    void Request(const char* reason) {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            pending_ = true;
+            reason_ = reason;
+        }
+        cv_.notify_one();
+    }
+
+    void Stop() {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            stop_ = true;
+        }
+        cv_.notify_one();
+        if (worker_.joinable()) worker_.join();
+    }
+
+private:
+    static constexpr auto kSettleTime = std::chrono::milliseconds(100);
+
+    void Run() {
+        std::unique_lock<std::mutex> lock(mutex_);
+        while (true) {
+            cv_.wait(lock, [this] { return stop_ || pending_; });
+            if (stop_) return;
+            pending_ = false;
+            while (cv_.wait_for(lock, kSettleTime, [this] { return stop_ || pending_; })) {
+                if (stop_) return;
+                pending_ = false;
+            }
+            const char* reason = reason_;
+            lock.unlock();
+            SafeCall("EncoderRebuildWorker", [&] { rebuild_(reason); });
+            lock.lock();
+        }
+    }
+
+    std::function<void(const char*)> rebuild_;
+    std::mutex mutex_;
+    std::condition_variable cv_;
+    bool pending_ = false;
+    bool stop_ = false;
+    const char* reason_ = "update";
+    std::thread worker_;
+};
+
+// Polls the input desktop. UAC prompts (with the default secure-desktop policy), Ctrl+Alt+Del
+// and the lock screen switch input to the Winlogon desktop, which only SYSTEM can open, so an
+// elevated user process can neither capture it nor inject input into it.
+class SecureDesktopMonitor {
+    std::atomic<bool>& running_;
+    std::function<void(bool)> onChange_;
+    std::thread worker_;
+
+    static bool IsSecureDesktopActive() {
+        HDESK desktop = OpenInputDesktop(0, FALSE, DESKTOP_READOBJECTS);
+        if (!desktop) return GetLastError() == ERROR_ACCESS_DENIED;
+        wchar_t name[64]{};
+        DWORD needed = 0;
+        bool secure = false;
+        if (GetUserObjectInformationW(desktop, UOI_NAME, name, sizeof(name), &needed)) {
+            secure = _wcsicmp(name, L"Default") != 0;
+        }
+        CloseDesktop(desktop);
+        return secure;
+    }
+
+    void Run() {
+        bool last = false;
+        while (running_.load(std::memory_order_acquire)) {
+            const bool secure = IsSecureDesktopActive();
+            if (secure != last) {
+                last = secure;
+                SafeCall("SecureDesktopMonitor", [&] { onChange_(secure); });
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(250));
+        }
+    }
+
+public:
+    SecureDesktopMonitor(std::atomic<bool>& r, std::function<void(bool)> onChange)
+        : running_(r), onChange_(std::move(onChange)), worker_([this] { Run(); }) {}
+    ~SecureDesktopMonitor() { if (worker_.joinable()) worker_.join(); }
+};
+
 class OfferProcessingGate {
 public:
     [[nodiscard]] uint64_t TryAcquire(int64_t staleAfterMs, bool& recoveredStaleOwner) {
@@ -214,6 +309,8 @@ void RegisterStaticAsset(
     const std::string& filePath,
     const char* missingContent = "") {
     server.Get(route, [contentType, filePath, missingContent](auto&, auto& response) {
+        // The client and host wire format ship together; never run a stale cached client.
+        response.set_header("Cache-Control", "no-cache");
         const auto content = LoadFile(filePath.c_str());
         response.set_content(content.empty() ? missingContent : content, contentType);
     });
@@ -793,6 +890,15 @@ int RunHostApp(int argc, char* argv[]) {
         std::unique_ptr<MicPlayback> micPlayback;
         try { micPlayback = std::make_unique<MicPlayback>("CABLE Input"); } catch (...) { LOG("MicPlayback not available"); }
 
+        std::atomic<bool> cursorCapture{false};
+        std::atomic<int64_t> lastEncodeTs{0};
+        std::atomic<int> targetFps{60};
+        // Bumped whenever streaming state is torn down so an in-progress rebuild can tell it is stale.
+        std::atomic<uint64_t> streamEpoch{0};
+        // Serializes encoder construction. Never held together with encoderMutex while building,
+        // so the encoder thread keeps encoding with the old encoder until the swap.
+        std::mutex encoderBuildMutex;
+
         auto updateEncoderInfo = [&](CodecType codec, const VideoEncoder* activeEncoder) {
             const bool usingHardware = activeEncoder && activeEncoder->IsUsingHardware();
             {
@@ -806,7 +912,7 @@ int RunHostApp(int argc, char* argv[]) {
         };
 
         auto createEncoder = [&](int width, int height, int fps, CodecType codec) {
-            auto nextEncoder = std::make_unique<VideoEncoder>(
+            return std::make_unique<VideoEncoder>(
                 width,
                 height,
                 fps,
@@ -814,9 +920,19 @@ int RunHostApp(int argc, char* argv[]) {
                 capture.GetCtx(),
                 capture.GetMT(),
                 codec);
-            currentCodec.store(codec, std::memory_order_release);
-            updateEncoderInfo(codec, nextEncoder.get());
-            return nextEncoder;
+        };
+
+        // Caller holds encoderMutex.
+        auto installEncoderLocked = [&](std::unique_ptr<VideoEncoder>& next) {
+            std::unique_ptr<VideoEncoder> previous = std::move(encoder);
+            encoder = std::move(next);
+            encoder->UpdateFPS(targetFps.load(std::memory_order_acquire));
+            encodeTargetWidth.store(encoder->GetWidth(), std::memory_order_release);
+            encodeTargetHeight.store(encoder->GetHeight(), std::memory_order_release);
+            currentCodec.store(encoder->GetCodec(), std::memory_order_release);
+            encoderReady.store(true, std::memory_order_release);
+            updateEncoderInfo(encoder->GetCodec(), encoder.get());
+            return previous;
         };
 
         auto resolveEncodeTarget = [&]() { return ResolveEncodeResolution(
@@ -825,21 +941,34 @@ int RunHostApp(int argc, char* argv[]) {
             clientTargetWidth.load(std::memory_order_acquire),
             clientTargetHeight.load(std::memory_order_acquire)); };
 
+        // Builds the replacement before touching the live encoder. On failure the current encoder
+        // (if any) keeps running, so a bad codec or size request never leaves the stream dead.
         auto rebuildEncoder = [&](int width, int height, int fps, CodecType codec) -> bool {
-            std::lock_guard<std::mutex> lock(encoderMutex);
-            encoderReady.store(false, std::memory_order_release);
-            encoder.reset();
+            std::lock_guard<std::mutex> buildLock(encoderBuildMutex);
+            const uint64_t epoch = streamEpoch.load(std::memory_order_acquire);
 
+            std::unique_ptr<VideoEncoder> next;
             try {
-                encoder = createEncoder(width, height, fps, codec);
-                encodeTargetWidth.store(width, std::memory_order_release);
-                encodeTargetHeight.store(height, std::memory_order_release);
-                encoderReady.store(true, std::memory_order_release);
-                return true;
+                next = createEncoder(width, height, fps, codec);
             } catch (const std::exception& ex) {
-                ERR("Encoder creation failed: %s", ex.what());
+                ERR("Encoder creation failed (%dx%d %s): %s", width, height, VideoEncoder::CodecName(codec), ex.what());
                 return false;
             }
+
+            std::unique_ptr<VideoEncoder> previous;
+            {
+                std::lock_guard<std::mutex> lock(encoderMutex);
+                if (epoch != streamEpoch.load(std::memory_order_acquire)) {
+                    DBG("Encoder rebuild discarded: streaming state reset while building");
+                    return false;
+                }
+                previous = installEncoderLocked(next);
+            }
+            previous.reset();
+            lastEncodeTs.store(0, std::memory_order_release);
+            webrtcServer->RequestKeyframe();
+            frameSlot.Wake();
+            return true;
         };
 
         auto rebuildResolvedEncoder = [&](int fps, CodecType codec, const char* reason) -> bool {
@@ -865,11 +994,26 @@ int RunHostApp(int argc, char* argv[]) {
             return rebuildEncoder(targetWidth, targetHeight, fps, codec);
         };
 
+        // Size-driven rebuilds (client viewport, host display mode). Skipped when there is no live
+        // encoder yet (onFpsChange creates it at the resolved size) or the target is unchanged;
+        // the encoder's GPU scaler covers any source/encode size mismatch in the meantime.
+        EncoderRebuildWorker rebuildWorker([&](const char* reason) {
+            if (!encoderReady.load(std::memory_order_acquire)) return;
+            const auto [targetWidth, targetHeight] = resolveEncodeTarget();
+            if (targetWidth == encodeTargetWidth.load(std::memory_order_acquire) &&
+                targetHeight == encodeTargetHeight.load(std::memory_order_acquire)) {
+                return;
+            }
+            rebuildResolvedEncoder(capture.GetCurrentFPS(), currentCodec.load(std::memory_order_acquire), reason);
+        });
+
         capture.SetResolutionChangeCallback([&](int width, int height, int fps) {
             LOG("Resolution change: %dx%d@%d", width, height, fps);
-            if (rebuildResolvedEncoder(fps, currentCodec.load(std::memory_order_acquire), "source-resolution-change")) {
-                webrtcServer->RequestKeyframe();
-            }
+            RefreshMonitorList();
+            UpdateInputBoundsForMonitor(input, capture.GetCurrentMonitorIndex());
+            webrtcServer->NotifyMonitorsChanged();
+            webrtcServer->RequestKeyframe();
+            rebuildWorker.Request("source-resolution-change");
         });
 
         capture.SetTargetReacquiredCallback([&](int idx) {
@@ -878,11 +1022,8 @@ int RunHostApp(int argc, char* argv[]) {
             wiggle.Request();
         });
 
-        std::atomic<bool> cursorCapture{false};
-        std::atomic<int64_t> lastEncodeTs{0};
-        std::atomic<int> targetFps{60};
-
         auto clearStreamingState = [&](bool resetFrameSlot) {
+            streamEpoch.fetch_add(1, std::memory_order_acq_rel);
             lastEncodeTs.store(0, std::memory_order_release);
             clientTargetWidth.store(0, std::memory_order_release);
             clientTargetHeight.store(0, std::memory_order_release);
@@ -913,11 +1054,9 @@ int RunHostApp(int argc, char* argv[]) {
                 } else {
                     try {
                         const auto [targetWidth, targetHeight] = resolveEncodeTarget();
-                        encoder = createEncoder(targetWidth, targetHeight, fps,
+                        auto next = createEncoder(targetWidth, targetHeight, fps,
                             currentCodec.load(std::memory_order_acquire));
-                        encodeTargetWidth.store(targetWidth, std::memory_order_release);
-                        encodeTargetHeight.store(targetHeight, std::memory_order_release);
-                        encoderReady.store(true, std::memory_order_release);
+                        installEncoderLocked(next);
                     } catch (const std::exception& e) {
                         ERR("Failed to create encoder: %s", e.what());
                     } catch (...) {
@@ -948,9 +1087,13 @@ int RunHostApp(int argc, char* argv[]) {
         callbacks.onCodecChange = [&](CodecType codec) -> bool {
                 if (codec == currentCodec.load(std::memory_order_acquire)) return true;
                 if (!(codecCaps & (1 << static_cast<int>(codec)))) return false;
-                if (!rebuildResolvedEncoder(capture.GetCurrentFPS(), codec, "codec-change")) return false;
-                lastEncodeTs.store(0, std::memory_order_release);
-                return true;
+                if (!encoderReady.load(std::memory_order_acquire)) {
+                    // Not streaming yet: the encoder is created on the first FPS message.
+                    currentCodec.store(codec, std::memory_order_release);
+                    return true;
+                }
+                // On failure the previous encoder is still installed, and the ACK carries the old codec.
+                return rebuildResolvedEncoder(capture.GetCurrentFPS(), codec, "codec-change");
             };
         callbacks.getCodec = [&] { return currentCodec.load(std::memory_order_acquire); };
         callbacks.getCodecCaps = [&] { return codecCaps; };
@@ -961,17 +1104,7 @@ int RunHostApp(int argc, char* argv[]) {
         callbacks.onStreamTargetChange = [&](int width, int height) {
                 clientTargetWidth.store(width, std::memory_order_release);
                 clientTargetHeight.store(height, std::memory_order_release);
-
-                const auto [targetWidth, targetHeight] = resolveEncodeTarget();
-                const int currentWidth = encodeTargetWidth.load(std::memory_order_acquire);
-                const int currentHeight = encodeTargetHeight.load(std::memory_order_acquire);
-                if (targetWidth == currentWidth && targetHeight == currentHeight) return;
-
-                if (rebuildResolvedEncoder(capture.GetCurrentFPS(), currentCodec.load(std::memory_order_acquire), "client-stream-target")) {
-                    webrtcServer->RequestKeyframe();
-                    lastEncodeTs.store(0, std::memory_order_release);
-                    frameSlot.Wake();
-                }
+                rebuildWorker.Request("client-stream-target");
             };
         callbacks.getClipboard = [&] { return input.GetClipboardText(); };
         callbacks.setClipboard = [&](const std::string& text) { return input.SetClipboardText(text); };
@@ -1032,6 +1165,11 @@ int RunHostApp(int argc, char* argv[]) {
             WARN("Tray init failed");
         }
 
+        SecureDesktopMonitor secureDesktopMonitor(app.running, [&](bool secure) {
+            webrtcServer->SetSecureDesktopActive(secure);
+            if (!secure) wiggle.Request();
+        });
+
         while (app.running.load(std::memory_order_acquire)) {
             if (!PumpAppTrayMessages()) {
                 break;
@@ -1040,6 +1178,7 @@ int RunHostApp(int argc, char* argv[]) {
         }
 
         LOG("Shutting down...");
+        rebuildWorker.Stop();
         ShutdownHost(audioCapture, micPlayback, server, frameSlot, capture, webrtcServer, portMapper, threads);
 
         CleanupAppTray();

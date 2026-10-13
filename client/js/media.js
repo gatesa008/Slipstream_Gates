@@ -3,7 +3,7 @@ import { C, MSG, CODECS } from './constants.js';
 import { S, $, mkBuf, log, safe, safeAsync,
     recordDecodeTime, recordAudioPacket, recordAudioDecoded, recordAudioBufferHealth,
     recordAudioUnderrun, recordAudioOverflow, logVideoDrop, logAudioDrop } from './state.js';
-import { queueFrameForPresentation, resetRenderer } from './renderer.js';
+import { queueFrameForPresentation } from './renderer.js';
 import { requestKeyframe, requestRecoveryKeyframe, sendAudioEnable, handleDecodePressure } from './protocol.js';
 let kfRetryInterval = null;
 let lastCaptureTs = 0;
@@ -64,125 +64,166 @@ const tryReinitDecoder = () => {
         S.reinit = 1;
         log.info('MEDIA', 'Scheduling decoder reinit');
         setTimeout(async () => {
-            await initDecoder();
+            await initDecoder(false, S.decoderCodec ?? S.currentCodec);
             S.reinit = 0;
         }, 100);
     }
 };
 const CODEC_MAP = Object.fromEntries(Object.values(CODECS).map(c => [c.id, c.codec]));
 
-export const initDecoder = async (force = false) => {
-    if (!window.VideoDecoder) {
-        logVideoDrop('VideoDecoder API not available');
-        return;
-    }
+// Supported decoder configs per codec string, so a mid-stream codec switch can configure
+// the new decoder without another async isConfigSupported round trip.
+const decoderConfigCache = new Map();
+// Keyframe that arrived while the decoder for its codec was being (re)initialized.
+let pendingKeyframe = null;
+let decoderInitSeq = 0;
 
-    S.ready = 0;
-    S.needKey = 1;
-    lastCaptureTs = 0;
-    decodeQueuePressureCount = 0;
-    lastDecodeQueuePressureAt = 0;
-
-    if (force) {
-        S.W = S.H = 0;
-        log.info('MEDIA', 'Force reinitializing decoder');
-    }
-    if (S.decoder && S.decoder.state !== 'closed') {
-        safe(() => S.decoder.close(), undefined, 'MEDIA');
-    }
-
-    const codec = CODEC_MAP[S.currentCodec] || CODEC_MAP[2];
-    log.info('MEDIA', 'Initializing decoder', { codec, codecId: S.currentCodec });
-
-    const decoder = S.decoder = new VideoDecoder({
-        output: frame => {
-            const now = performance.now();
-            const meta = S.frameMeta.get(frame.timestamp);
-
-            if (meta?.decodeStartMs) {
-                const decodeTime = now - meta.decodeStartMs;
-                recordDecodeTime(decodeTime, S.decoder?.decodeQueueSize || 0);
-                if (decodeTime > 50) {
-                    log.warn('MEDIA', 'Slow decode', {
-                        decodeMs: decodeTime.toFixed(1),
-                        queueSize: S.decoder?.decodeQueueSize || 0,
-                        w: frame.displayWidth, h: frame.displayHeight,
-                        ts: frame.timestamp
-                    });
-                }
-            }
-
-            log.debug('MEDIA', 'Frame decoded', {
-                ts: frame.timestamp, w: frame.displayWidth, h: frame.displayHeight,
-                queueSize: S.decoder?.decodeQueueSize || 0
-            });
-            if (meta) meta.decodeOutputMs = now;
-
-            queueFrameForPresentation({
-                frame,
-                meta,
-                queuedAt: now,
-                timestamp: frame.timestamp,
-                sourceTs: meta?.sourceTs || meta?.capTs || frame.timestamp
-            });
-        },
-        error: e => {
-            log.error('MEDIA', 'Decoder error', {
-                error: e.message, codec,
-                decoderState: S.decoder?.state,
-                queueSize: S.decoder?.decodeQueueSize || 0,
-                decodeErrors: S.stats.decodeErrors
-            });
-            S.stats.decodeErrors++;
-            S.ready = 1;
-            S.needKey = 1;
-            requestKeyframe('decoder-error');
-            startKeyframeRetry();
-            tryReinitDecoder();
-        }
-    });
-    let configured = false;
-    const decodeModes = [[true, 'HW'], [false, 'SW']];
-    for (const [preferHw, label] of decodeModes) {
+const resolveDecoderConfig = async codec => {
+    const cached = decoderConfigCache.get(codec);
+    if (cached) return cached;
+    for (const [preferHw, label] of [[true, 'HW'], [false, 'SW']]) {
         const config = {
             codec,
             optimizeForLatency: true,
             latencyMode: 'realtime',
             hardwareAcceleration: preferHw ? 'prefer-hardware' : 'prefer-software'
         };
-
-        const supported = await safeAsync(
-            () => VideoDecoder.isConfigSupported(config),
-            null,
-            'MEDIA'
-        );
-
+        const supported = await safeAsync(() => VideoDecoder.isConfigSupported(config), null, 'MEDIA');
         if (supported?.supported) {
-            decoder.configure(supported.config);
-            S.hwAccel = label;
-            configured = true;
-            log.info('MEDIA', 'Decoder configured', { codec, accel: label });
-            break;
+            const entry = { config: supported.config, accel: label };
+            decoderConfigCache.set(codec, entry);
+            return entry;
         }
     }
+    return null;
+};
 
+const createVideoDecoder = codec => new VideoDecoder({
+    output: frame => {
+        const now = performance.now();
+        const meta = S.frameMeta.get(frame.timestamp);
+
+        if (meta?.decodeStartMs) {
+            const decodeTime = now - meta.decodeStartMs;
+            recordDecodeTime(decodeTime, S.decoder?.decodeQueueSize || 0);
+            if (decodeTime > 50) {
+                log.warn('MEDIA', 'Slow decode', {
+                    decodeMs: decodeTime.toFixed(1),
+                    queueSize: S.decoder?.decodeQueueSize || 0,
+                    w: frame.displayWidth, h: frame.displayHeight,
+                    ts: frame.timestamp
+                });
+            }
+        }
+
+        log.debug('MEDIA', 'Frame decoded', {
+            ts: frame.timestamp, w: frame.displayWidth, h: frame.displayHeight,
+            queueSize: S.decoder?.decodeQueueSize || 0
+        });
+        if (meta) meta.decodeOutputMs = now;
+
+        queueFrameForPresentation({
+            frame,
+            meta,
+            queuedAt: now,
+            timestamp: frame.timestamp,
+            sourceTs: meta?.sourceTs || meta?.capTs || frame.timestamp
+        });
+    },
+    error: e => {
+        log.error('MEDIA', 'Decoder error', {
+            error: e.message, codec,
+            decoderState: S.decoder?.state,
+            queueSize: S.decoder?.decodeQueueSize || 0,
+            decodeErrors: S.stats.decodeErrors
+        });
+        S.stats.decodeErrors++;
+        S.ready = 1;
+        S.needKey = 1;
+        requestKeyframe('decoder-error');
+        startKeyframeRetry();
+        tryReinitDecoder();
+    }
+});
+
+export const initDecoder = async (force = false, codecId = S.currentCodec) => {
+    if (!window.VideoDecoder) {
+        logVideoDrop('VideoDecoder API not available');
+        return;
+    }
+
+    const seq = ++decoderInitSeq;
+    S.ready = 0;
+    S.needKey = 1;
+    S.decoderCodec = codecId;
+    lastCaptureTs = 0;
+    decodeQueuePressureCount = 0;
+    lastDecodeQueuePressureAt = 0;
+
+    if (force) log.info('MEDIA', 'Force reinitializing decoder');
+    if (S.decoder && S.decoder.state !== 'closed') {
+        safe(() => S.decoder.close(), undefined, 'MEDIA');
+    }
+    S.decoder = null;
+
+    const codec = CODEC_MAP[codecId] || CODEC_MAP[2];
+    log.info('MEDIA', 'Initializing decoder', { codec, codecId });
+
+    const resolved = await resolveDecoderConfig(codec);
+    if (seq !== decoderInitSeq) return;  // superseded by a newer init (e.g. another codec switch)
+
+    if (!resolved) {
+        S.hwAccel = 'NONE';
+        log.error('MEDIA', 'Decoder configuration failed', { codec });
+        logVideoDrop('Decoder configuration failed', { codec });
+        return;
+    }
+
+    const decoder = S.decoder = createVideoDecoder(codec);
+    const configured = safe(() => { decoder.configure(resolved.config); return true; }, false, 'MEDIA');
     if (!configured || decoder.state !== 'configured') {
+        decoderConfigCache.delete(codec);
         S.hwAccel = 'NONE';
         log.error('MEDIA', 'Decoder configuration failed', { codec, state: decoder.state });
         logVideoDrop('Decoder configuration failed', { codec });
         return;
     }
 
+    S.hwAccel = resolved.accel;
     S.ready = 1;
+    log.info('MEDIA', 'Decoder configured', { codec, accel: resolved.accel });
+
+    const stashed = pendingKeyframe;
+    pendingKeyframe = null;
+    if (stashed && stashed.codec === codecId && decodeFrame(stashed)) return;
     requestKeyframe('decoder-init');
     startKeyframeRetry();
-    resetRenderer();
+};
+
+export const resetVideoDecoderState = () => {
+    decoderInitSeq++;
+    pendingKeyframe = null;
+    S.decoderCodec = null;
 };
 
 export const decodeFrame = data => {
+    // The host tags every frame with its codec, so a switch is driven by the stream itself:
+    // stale frames from the old codec are dropped and the first new keyframe is kept.
+    const frameCodec = data.codec ?? S.decoderCodec ?? S.currentCodec;
+    if (frameCodec !== S.decoderCodec) {
+        if (data.isKey) pendingKeyframe = { ...data, codec: frameCodec };
+        log.info('MEDIA', 'Stream codec changed - switching decoder', { from: S.decoderCodec, to: frameCodec, isKey: data.isKey ? 1 : 0 });
+        S.currentCodec = frameCodec;
+        initDecoder(false, frameCodec).catch(e => log.error('MEDIA', 'Decoder switch failed', { error: e?.message }));
+        return false;
+    }
+
     if (!S.ready) {
+        if (data.isKey) {
+            pendingKeyframe = { ...data, codec: frameCodec };
+            return false;
+        }
         logVideoDrop('Decoder not ready', { decoderState: S.decoder?.state, needKey: S.needKey });
-        requestKeyframe('decoder-not-ready');
         return false;
     }
 
@@ -286,7 +327,65 @@ export const decodeFrame = data => {
         return false;
     }
 };
+// Packet ids become decoder timestamps (10 ms apart), so output gaps show exactly which
+// packets never arrived and the worklet can conceal them in order.
+const AUDIO_PACKET_US = 10000;
+let lastAudioOutputTs = null;
+let audioDecoderRecreateTimer = null;
+
+const createAudioDecoder = () => {
+    const decoder = S.audioDecoder = new AudioDecoder({
+        output: audioData => {
+            if (S.audioEnabled && workletReady) {
+                recordAudioDecoded();
+                const ts = audioData.timestamp;
+                if (lastAudioOutputTs !== null && ts > lastAudioOutputTs) {
+                    const missing = Math.round((ts - lastAudioOutputTs) / AUDIO_PACKET_US) - 1;
+                    if (missing > 0 && missing <= 8) {
+                        workletNode.port.postMessage({ type: 'gap', frames: missing * (C.AUDIO_RATE / 100) });
+                    }
+                }
+                lastAudioOutputTs = ts;
+                sendToWorklet(audioData);
+            } else {
+                logAudioDrop('Discarded (disabled)');
+                audioData.close();
+            }
+        },
+        error: e => {
+            log.error('AUDIO', 'AudioDecoder error', {
+                error: e.message,
+                decoderState: decoder.state,
+                queueSize: decoder.decodeQueueSize || 0
+            });
+            logAudioDrop('Decoder error', { error: e.message });
+            scheduleAudioDecoderRecreate();
+        }
+    });
+
+    decoder.configure({
+        codec: 'opus',
+        sampleRate: C.AUDIO_RATE,
+        numberOfChannels: C.AUDIO_CH
+    });
+    lastAudioOutputTs = null;
+    log.debug('AUDIO', 'Decoder configured');
+    return decoder;
+};
+
+// A decoder error closes the AudioDecoder for good; without this, audio stays dead until reconnect.
+const scheduleAudioDecoderRecreate = () => {
+    if (audioDecoderRecreateTimer || !window.AudioDecoder) return;
+    audioDecoderRecreateTimer = setTimeout(() => {
+        audioDecoderRecreateTimer = null;
+        if (S.audioDecoder && S.audioDecoder.state !== 'closed') safe(() => S.audioDecoder.close(), undefined, 'AUDIO');
+        if (safe(createAudioDecoder, null, 'AUDIO')) log.info('AUDIO', 'AudioDecoder recreated');
+        resetAudioState();
+    }, 100);
+};
+
 const resetAudioState = () => {
+    lastAudioOutputTs = null;
     if (workletNode) {
         safe(() => workletNode.port.postMessage({ type: 'clear' }), undefined, 'AUDIO');
         log.debug('AUDIO', 'Worklet state cleared');
@@ -343,6 +442,9 @@ export const initAudio = async () => {
                     });
                 }
                 for (let i = 0; i < (e.data.overflows || 0); i++) recordAudioOverflow();
+                if ((e.data.concealed || 0) > 0) {
+                    log.debug('AUDIO', 'Concealed lost packets', { count: e.data.concealed, targetMs: e.data.targetMs });
+                }
             } else if (type === 'drop') {
                 logAudioDrop(e.data.reason);
             } else {
@@ -351,33 +453,18 @@ export const initAudio = async () => {
         };
 
         workletNode.connect(gain);
+        ctx.onstatechange = () => {
+            log.info('AUDIO', 'AudioContext state', { state: ctx.state });
+            // Interrupted (device change, OS audio session loss, backgrounded tab): resume and
+            // drop whatever piled up so playback restarts at the live edge.
+            if (ctx.state === 'interrupted' || ctx.state === 'suspended') {
+                if (S.audioEnabled) safeAsync(() => ctx.resume(), undefined, 'AUDIO');
+            } else if (ctx.state === 'running') {
+                resetAudioState();
+            }
+        };
         if (window.AudioDecoder) {
-            const decoder = S.audioDecoder = new AudioDecoder({
-                output: audioData => {
-                    if (S.audioEnabled && workletReady) {
-                        recordAudioDecoded();
-                        sendToWorklet(audioData);
-                    } else {
-                        logAudioDrop('Discarded (disabled)');
-                        audioData.close();
-                    }
-                },
-                error: e => {
-                    log.error('AUDIO', 'AudioDecoder error', {
-                        error: e.message,
-                        decoderState: S.audioDecoder?.state,
-                        queueSize: S.audioDecoder?.decodeQueueSize || 0
-                    });
-                    logAudioDrop('Decoder error', { error: e.message });
-                }
-            });
-
-            decoder.configure({
-                codec: 'opus',
-                sampleRate: C.AUDIO_RATE,
-                numberOfChannels: C.AUDIO_CH
-            });
-            log.debug('AUDIO', 'Decoder configured');
+            createAudioDecoder();
         } else {
             log.warn('AUDIO', 'AudioDecoder API not available');
         }
@@ -455,7 +542,7 @@ export const handleAudioPacket = data => {
     recordAudioPacket();
 
     const view = new DataView(data);
-    const timestamp = Number(view.getBigUint64(4, true));
+    const packetId = view.getUint32(12, true);
     const samples = view.getUint16(16, true);
     const payloadLength = view.getUint16(18, true);
 
@@ -469,9 +556,11 @@ export const handleAudioPacket = data => {
             state: S.audioDecoder?.state,
             hasDecoder: !!S.audioDecoder
         });
+        if (S.audioDecoder?.state === 'closed') scheduleAudioDecoderRecreate();
         return;
     }
 
+    const timestamp = packetId * AUDIO_PACKET_US;
     const result = safe(() => {
         const chunk = new EncodedAudioChunk({
             type: 'key',

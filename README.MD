@@ -371,7 +371,7 @@ build\bin\Release\SlipStream.exe [--debug] [--trace] [--force-software]
 | 46 | 2 | totalChunks | Number of data chunks |
 | 48 | 2 | chunkBytes | Payload bytes in this packet |
 | 50 | 2 | dataChunkSize | Nominal data-chunk size |
-| 52 | 1 | frameType | 1=keyframe, 0=delta |
+| 52 | 1 | frameType | Bit 0: 1=keyframe, 0=delta. Bits 4-6: codec + 1 (1=AV1, 2=H.265, 3=H.264; 0=untagged) |
 | 53 | 1 | packetType | 0=data, 1=FEC parity |
 | 54 | 1 | fecGroupSize | Effective FEC group size for this frame |
 
@@ -384,7 +384,8 @@ build\bin\Release\SlipStream.exe [--debug] [--trace] [--force-software]
 | API | WASAPI Loopback |
 | Mode | Shared |
 | Sample Rate | 48,000 Hz (resampled if system differs) |
-| Channels | Stereo (max 2) |
+| Channels | Stereo (max 2); 5.1/7.1 mix formats are downmixed using the channel mask |
+| Device Changes | Follows the default output endpoint; reopens on device loss or default-device change |
 | Frame Duration | 10 ms (480 samples) |
 
 ### Encoding
@@ -406,7 +407,7 @@ build\bin\Release\SlipStream.exe [--debug] [--trace] [--force-software]
 | Audio Buffer | 128 KB threshold |
 | Max Queue | 6 packets (WebRTC send queue), 4 packets capture queue |
 | Delivery | Unordered, maxRetransmits=0 |
-| FEC | XOR parity packet every 10 audio packets |
+| FEC | XOR parity packet every 4 audio packets |
 
 ### Audio Packet Header (24 bytes)
 
@@ -418,21 +419,22 @@ build\bin\Release\SlipStream.exe [--debug] [--trace] [--force-software]
 | 16 | 2 | samples | Sample count (data packets only) |
 | 18 | 2 | dataLength | Payload size |
 | 20 | 1 | packetType | 0=data, 1=FEC parity |
-| 21 | 1 | fecGroupSize | FEC group size (currently 10) |
+| 21 | 1 | fecGroupSize | FEC group size (currently 4) |
 | 22 | 2 | reserved | Reserved (0) |
 
 ### Client Playback
 
 | Component | Detail |
 |-----------|--------|
-| Decoder | AudioDecoder (WebCodecs) |
-| Processor | AudioWorklet with ring buffer |
-| Ring Buffer Capacity | 24,000 samples (500 ms) |
-| Prebuffer Threshold | 1,920 samples (40 ms) |
-| Target Buffer | 2,880 samples (60 ms) |
-| Max Buffer | 5,760 samples (120 ms) |
-| Underrun Adaptation | After 4 consecutive underruns, increases target by 480 samples (10 ms) |
-| Health Adjustment | Every 2 seconds, reduces target by 240 samples (5 ms) if buffer > 90 ms |
+| Decoder | AudioDecoder (WebCodecs); recreated automatically after a decoder error |
+| Reordering | Packets released in packetId order; a missing packet is waited on for up to 40 ms (or 8 held packets), then skipped |
+| Loss Concealment | Last 10 ms replayed under a fade-out, next packet faded in |
+| Processor | AudioWorklet with ring buffer and variable-rate (4-point Hermite) reader |
+| Ring Buffer Capacity | 48,000 samples (1 s) |
+| Target Buffer | Starts at 60 ms; +10 ms per underrun (max 180 ms), -2 ms every 5 s once stable for 10 s (min 30 ms) |
+| Drift Correction | Playback speed adjusted up to ±0.5% to hold the target; also resamples when the AudioContext is not 48 kHz |
+| Catch-up | Above 2 × target + 40 ms, skips back to target with a fade-in |
+| Underrun | Fades to silence and prebuffers to 80% of the (raised) target |
 
 ## Microphone Pipeline (Client to Server)
 
@@ -587,6 +589,8 @@ Cursor types: 0=default, 1=text, 2=pointer, 3=wait, 4=progress, 5=crosshair, 6=m
 | CLIPBOARD_GET | 0x434C4754 | 4 | Request clipboard contents |
 | CLIPBOARD_DATA | 0x434C4950 | 8+N | Clipboard text transfer |
 | VERSION | 0x56455253 | Variable | Host version string |
+| STREAM_TARGET | 0x56505254 | 8 | Client viewport size in device pixels (encode target is capped at the source size) |
+| DESKTOP_STATE | 0x44534B54 | 5 | 0 = normal desktop, 1 = secure desktop (UAC, Ctrl+Alt+Del, lock screen) active on the host |
 | KICKED | 0x4B49434B | 4 | Client disconnected by server |
 
 ### Codec Capabilities (CODEC_CAPS)

@@ -53,7 +53,7 @@ class WebRTCServer {
     std::shared_ptr<rtc::DataChannel> controlDataChannel_, videoDataChannel_, audioDataChannel_, inputDataChannel_, micDataChannel_;
     std::mutex channelMutex_;
 
-    std::atomic<bool> conn{false}, needsKey{true}, fpsRecv{false}, gathered{false}, hasDesc{false};
+    std::atomic<bool> conn{false}, needsKey{true}, fpsRecv{false}, gathered{false}, hasDesc{false}, secureDesktop{false};
     std::atomic<int> chRdy{0}, overflow{0};
     std::atomic<int64_t> lastPing{0}, lastStatLog{0}, lastKeyReqMs{0};
     std::atomic<uint32_t> frmId{0}, audioPktId{0};
@@ -71,7 +71,8 @@ class WebRTCServer {
     static constexpr size_t VID_BUF=262144, AUD_BUF=131072, CHUNK=1400;
     static constexpr size_t HDR_SZ=sizeof(PacketHeader), DATA_CHUNK=CHUNK-HDR_SZ, BUF_LOW=CHUNK*16;
     static constexpr int NUM_CH=5;
-    static constexpr uint8_t AUDIO_FEC_GROUP_SIZE = 10;
+    // Small groups so a parity packet arrives within the client's audio reorder window (4 x 10 ms).
+    static constexpr uint8_t AUDIO_FEC_GROUP_SIZE = 4;
     static constexpr uint8_t MIC_FEC_GROUP_SIZE = 10;
 
     std::array<std::vector<uint8_t>, AUDIO_FEC_GROUP_SIZE> audioFecPackets_;
@@ -89,6 +90,7 @@ class WebRTCServer {
     void SendMonitorList();
     void SendCodecCaps();
     void SendVersion();
+    void SendDesktopState();
     void HandleCtrl(const rtc::binary& m);
     void HandleInput(const rtc::binary& m);
     void HandleMic(const rtc::binary& m);
@@ -124,5 +126,7 @@ public:
     [[nodiscard]] bool SendCursorShape(CursorType ct);
     [[nodiscard]] bool Send(const EncodedFrame& f);
     [[nodiscard]] bool SendAudio(const std::vector<uint8_t>& data, int64_t ts, int samples);
+    void SetSecureDesktopActive(bool active);
+    void NotifyMonitorsChanged();
     void GetStats(uint64_t& vS, uint64_t& vE, uint64_t& aS, uint64_t& aE, uint64_t& c);
 };

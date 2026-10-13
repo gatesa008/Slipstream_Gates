@@ -9,6 +9,9 @@ body.pointer-locked #c{cursor:none}
 .auth-overlay{z-index:1001;opacity:0;visibility:hidden}
 .loading-overlay.hidden{opacity:0;visibility:hidden;pointer-events:none}
 .auth-overlay.visible{opacity:1;visibility:visible}
+.secure-notice{position:fixed;top:16px;left:50%;transform:translate(-50%,-8px);max-width:min(460px,calc(100vw - 32px));display:flex;flex-direction:column;gap:4px;padding:12px 16px;background:rgba(24,24,27,.96);border:1px solid rgba(245,158,11,.4);border-left:3px solid var(--wa);border-radius:var(--r);box-shadow:var(--sh-panel);font-size:12px;color:var(--t2);line-height:1.45;z-index:900;opacity:0;visibility:hidden;pointer-events:none;transition:opacity .2s,transform .2s,visibility .2s}
+.secure-notice strong{font-size:13px;color:var(--t1)}
+.secure-notice.visible{opacity:1;visibility:visible;transform:translate(-50%,0)}
 .loading-container,.auth-container{display:flex;flex-direction:column;align-items:center;width:100%;text-align:center}
 .loading-container{gap:16px;max-width:320px}
 .auth-container{max-width:300px;background:linear-gradient(145deg,rgba(24,24,27,.98),rgba(17,17,19,.98));border:1px solid var(--bd);border-radius:var(--rl);padding:28px 24px;box-shadow:var(--sh-panel)}

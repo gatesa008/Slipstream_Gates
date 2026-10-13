@@ -29,6 +29,10 @@ export const hideLoading = () => {
     setTimeout(() => loadEl.classList.add('hidden'), 300);
     log.debug('UI', 'Loading hidden');
 };
+const secureNoticeEl = $('secureNotice');
+export const setSecureDesktopNotice = active => {
+    secureNoticeEl?.classList.toggle('visible', !!active);
+};
 bus.on('fps:applied', fps => updateFpsDropdown(fps));
 const fpsSel = $('fpsSel');
 const monSel = $('monSel');

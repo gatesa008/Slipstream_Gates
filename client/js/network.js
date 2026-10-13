@@ -4,10 +4,10 @@ import { MSG, C } from './constants.js';
 import { S, $, safe, updateClockOffset, resetClockSync,
     startMetricsLogger, stopMetricsLogger, resetSessionStats, recordPacket,
     clientTimeUs, logVideoDrop, logAudioDrop, logNetworkDrop, log, bus } from './state.js';
-import { handleAudioPacket, closeAudio, initDecoder, decodeFrame, stopKeyframeRetry } from './media.js';
+import { handleAudioPacket, closeAudio, initDecoder, decodeFrame, stopKeyframeRetry, resetVideoDecoderState } from './media.js';
 import { updateMonOpts, updateCodecOpts, updateCodecDropdown, setHostCodecs,
     updateLoadingStage, showLoading, hideLoading, getStoredCodec, initCodecDetection,
-    getStoredFps, updateFpsDropdown, closeTabbedMode } from './ui.js';
+    getStoredFps, updateFpsDropdown, closeTabbedMode, setSecureDesktopNotice } from './ui.js';
 import { resetRenderer, setCursorStyle } from './renderer.js';
 import { stopMic } from './mic.js';
 import { showAuth, clearSession, validateSession } from './auth.js';
@@ -38,6 +38,16 @@ const audioFecGroups = new Map();
 const seenAudioPacketIds = new Set();
 let lastAudioFecCleanupAt = 0;
 const pendingVideoFec = new Map();
+
+// The audio channel is unordered with no retransmits, so packets can arrive out of order.
+// Opus decoding is stateful, so hold early arrivals briefly and release them in packet order;
+// a hole that outlives the wait (or a FEC recovery) is skipped and concealed by the worklet.
+const AUDIO_REORDER_WAIT_MS = 40;
+const AUDIO_REORDER_MAX_HELD = 8;
+const AUDIO_RESYNC_DISTANCE = 200;
+const heldAudioPackets = new Map();
+let audioNextPacketId = null;
+let audioReorderTimer = null;
 
 const hasPublicIceCandidate = sdp => sdp.includes(' typ srflx') || sdp.includes(' typ relay');
 
@@ -88,8 +98,54 @@ const rememberAndDeliverAudioPacket = (packetId, packet) => {
     if (seenAudioPacketIds.has(packetId)) return false;
     seenAudioPacketIds.add(packetId);
     trimSeenAudioPacketIds();
-    deliverAudioPacket(packet);
+    enqueueOrderedAudio(packetId, packet);
     return true;
+};
+
+const resetAudioReorder = () => {
+    heldAudioPackets.clear();
+    audioNextPacketId = null;
+    audioReorderTimer = clearTimer(audioReorderTimer, clearTimeout);
+};
+
+const flushHeldAudio = now => {
+    while (heldAudioPackets.size > 0) {
+        const next = heldAudioPackets.get(audioNextPacketId);
+        if (next) {
+            heldAudioPackets.delete(audioNextPacketId);
+            audioNextPacketId++;
+            deliverAudioPacket(next.packet);
+            continue;
+        }
+        let oldestAt = Infinity, lowestId = Infinity;
+        for (const [id, entry] of heldAudioPackets) {
+            if (entry.at < oldestAt) oldestAt = entry.at;
+            if (id < lowestId) lowestId = id;
+        }
+        if (now - oldestAt < AUDIO_REORDER_WAIT_MS && heldAudioPackets.size < AUDIO_REORDER_MAX_HELD) break;
+        log.debug('NET', 'Audio packets lost', { from: audioNextPacketId, count: lowestId - audioNextPacketId });
+        audioNextPacketId = lowestId;
+    }
+    if (heldAudioPackets.size > 0 && !audioReorderTimer) {
+        audioReorderTimer = setTimeout(() => {
+            audioReorderTimer = null;
+            flushHeldAudio(performance.now());
+        }, AUDIO_REORDER_WAIT_MS);
+    }
+};
+
+const enqueueOrderedAudio = (packetId, packet) => {
+    if (audioNextPacketId === null || Math.abs(packetId - audioNextPacketId) > AUDIO_RESYNC_DISTANCE) {
+        // First packet, or the host restarted its counter: start fresh from here.
+        heldAudioPackets.clear();
+        audioNextPacketId = packetId;
+    }
+    if (packetId < audioNextPacketId) {
+        logAudioDrop('Late packet', { packetId, expected: audioNextPacketId });
+        return;
+    }
+    heldAudioPackets.set(packetId, { packet, at: performance.now() });
+    flushHeldAudio(performance.now());
 };
 
 const clearTimer = (timer, clear) => {
@@ -309,7 +365,7 @@ const processFrame = (frameId, frame) => {
     if (buffer.byteLength >= 4) {
         const d = buffer instanceof Uint8Array ? buffer : new Uint8Array(buffer);
         let validStart = false;
-        const codecId = S.currentCodec;
+        const codecId = frame.codec ?? S.currentCodec;
         if (codecId === 2) { // H.264
             validStart = (d[0] === 0x00 && d[1] === 0x00 && d[2] === 0x00 && d[3] === 0x01) ||
                          (d[0] === 0x00 && d[1] === 0x00 && d[2] === 0x01);
@@ -365,6 +421,7 @@ const processFrame = (frameId, frame) => {
 
     const decodeAccepted = decodeFrame({
         buf: buffer,
+        codec: frame.codec,
         capTs: frame.capTs,
         sourceTs: frame.sourceTs,
         encodeEndTs: frame.encodeEndTs,
@@ -429,7 +486,11 @@ const handleControl = async e => {
     if (msgType === MSG.CODEC_ACK && length === 5) {
         S.currentCodec = view.getUint8(4);
         updateCodecDropdown(S.currentCodec);
-        await initDecoder(true);
+        // The stream may already have switched the decoder (frames carry their codec); only
+        // (re)initialize when nothing is set up for the acknowledged codec.
+        if (S.decoderCodec !== S.currentCodec || !S.decoder || S.decoder.state === 'closed') {
+            await initDecoder(true, S.currentCodec);
+        }
         resendStreamTarget();
         if (!S.fpsSent) applyFps(getStoredFps() ?? 60);
         log.info('NET', 'Codec ack', { codec: S.currentCodec });
@@ -453,6 +514,13 @@ const handleControl = async e => {
             try { await navigator.clipboard.writeText(text); log.debug('NET', 'Clipboard set', { len: textLen }); }
             catch (err) { logNetworkDrop('Clipboard write failed', { error: err?.message }); }
         }
+        return recordPacket(length, 'control');
+    }
+    if (msgType === MSG.DESKTOP_STATE && length === 5) {
+        const secure = view.getUint8(4) === 1;
+        setSecureDesktopNotice(secure);
+        if (!secure) requestKeyframe('secure-desktop-exit');
+        log.info('NET', 'Host desktop state', { secure });
         return recordPacket(length, 'control');
     }
     if (msgType === MSG.CURSOR_SHAPE && length === 5) { setCursorStyle(view.getUint8(4)); return recordPacket(length, 'control'); }
@@ -495,7 +563,11 @@ const handleVideo = e => {
     const totalChunks = view.getUint16(46, true);
     const chunkBytes = view.getUint16(48, true);
     const dataChunkSize = view.getUint16(50, true);
+    // frameType: bit 0 = keyframe, bits 4-6 = codec + 1 (0 on hosts that don't tag frames).
     const frameType = view.getUint8(52);
+    const isKey = (frameType & 1) === 1;
+    const codecTag = (frameType >> 4) & 0x7;
+    const frameCodec = codecTag ? codecTag - 1 : null;
     const packetType = view.getUint8(53);
     const fecGroupSize = view.getUint8(54) || C.FEC_GROUP_SIZE;
 
@@ -547,7 +619,8 @@ const handleVideo = e => {
                 sourceTs,
                 encodeEndTs,
                 enqueueTs,
-                isKey: frameType === 1,
+                isKey,
+                codec: frameCodec,
                 fecGroupSize: Math.max(1, fecGroupSize)
             }, chunkIndex, chunkData, arrivalMs);
             return;
@@ -559,7 +632,7 @@ const handleVideo = e => {
             sourceTs,
             encodeEndTs,
             enqueueTs,
-            encMs: view.getUint32(32, true) / 1000, arrivalMs, lastPacketMs: arrivalMs, isKey: frameType === 1,
+            encMs: view.getUint32(32, true) / 1000, arrivalMs, lastPacketMs: arrivalMs, isKey, codec: frameCodec,
             frameSize, dataChunkSize, fecGroupSize: Math.max(1, fecGroupSize),
             fecParts: new Map(), fecRecovered: 0
         });
@@ -730,7 +803,9 @@ const cleanup = () => {
     closeDataChannels();
     audioFecGroups.clear();
     seenAudioPacketIds.clear();
+    resetAudioReorder();
     pendingVideoFec.clear();
+    setSecureDesktopNotice(false);
 };
 
 const resetState = () => {
@@ -738,6 +813,7 @@ const resetState = () => {
     if (S.decoder && S.decoder.state !== 'closed') safe(() => S.decoder.close(), undefined, 'MEDIA');
     DC_KEYS.forEach(k => S[k] = null);
     S.pc = S.decoder = null;
+    resetVideoDecoderState();
     S.ready = S.fpsSent = S.codecSent = waitingFirstFrame = 0;
     S.hostEncoderName = null;
     hasConnection = false;

@@ -48,7 +48,8 @@ class ScreenCapture {
 
     ID3D11Texture2D* texPool[POOL]{};
     uint64_t texFences[POOL]{};
-    int texIdx = 0, w = 0, h = 0, hostFps = 60;
+    int texIdx = 0, hostFps = 60;
+    std::atomic<int> w{0}, h{0};
 
     std::atomic<int> targetFps{60}, monIdx{0};
     std::atomic<uint64_t> captureGen{0};
@@ -64,6 +65,8 @@ class ScreenCapture {
     bool cursorCapture = false;
 
     int FindTex();
+    bool CreateTexturePool(int width, int height, ID3D11Texture2D* (&out)[POOL]);
+    bool ResizeCaptureTargets(int newW, int newH);
     void OnFrame(WGC::Direct3D11CaptureFramePool const& s, winrt::Windows::Foundation::IInspectable const&);
     void WaitCB(int ms = 500);
     void InitMon(HMONITOR mon, bool keepFps = false);

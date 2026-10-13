@@ -11,11 +11,21 @@ enum MsgType : uint32_t {
     MSG_CLIPBOARD_GET=0x434C4754, MSG_KICKED=0x4B49434B, MSG_CURSOR_CAPTURE=0x43555243,
     MSG_CURSOR_SHAPE=0x43555253, MSG_AUDIO_ENABLE=0x41554445, MSG_MIC_DATA=0x4D494344,
     MSG_MIC_ENABLE=0x4D494345, MSG_ENCODER_INFO=0x49434E45, MSG_VERSION=0x56455253,
-    MSG_STREAM_TARGET=0x56505254
+    MSG_STREAM_TARGET=0x56505254, MSG_DESKTOP_STATE=0x44534B54
 };
 
 enum CodecType : uint8_t { CODEC_AV1=0, CODEC_H265=1, CODEC_H264=2 };
 enum PacketType : uint8_t { PKT_DATA=0, PKT_FEC=1 };
+
+// Video PacketHeader::frameType layout: bit 0 = keyframe, bits 4-6 = codec + 1 (0 = untagged).
+constexpr uint8_t kFrameTypeKeyBit = 0x01;
+constexpr uint8_t kFrameTypeCodecShift = 4;
+constexpr uint8_t MakeVideoFrameType(bool isKey, CodecType codec) {
+    return static_cast<uint8_t>((isKey ? kFrameTypeKeyBit : 0) | ((static_cast<uint8_t>(codec) + 1) << kFrameTypeCodecShift));
+}
+
+// MSG_DESKTOP_STATE payload byte.
+enum DesktopState : uint8_t { DESKTOP_NORMAL=0, DESKTOP_SECURE=1 };
 
 enum CursorType : uint8_t {
     CURSOR_DEFAULT=0, CURSOR_TEXT, CURSOR_POINTER, CURSOR_WAIT, CURSOR_PROGRESS, CURSOR_CROSSHAIR,

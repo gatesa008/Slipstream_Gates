@@ -152,11 +152,20 @@ void ScreenCapture::OnFrame(WGC::Direct3D11CaptureFramePool const& s, winrt::Win
 
     if (!running.load() || !capturing.load()) return;
 
-    std::lock_guard<std::recursive_mutex> lk(mtx);
+    std::unique_lock<std::recursive_mutex> lk(mtx);
     if (!running.load() || !capturing.load() || gen != captureGen.load()) return;
 
     auto csz = f.ContentSize();
-    if (csz.Width != w || csz.Height != h) return;
+    if (csz.Width != w || csz.Height != h) {
+        // The source changed size (display mode, DPI, rotation). Recreate the pool at the
+        // new size; frames resume on the next FrameArrived. Notify outside the lock.
+        if (csz.Width <= 0 || csz.Height <= 0 || !ResizeCaptureTargets(csz.Width, csz.Height)) return;
+        const int newW = w, newH = h, fps = targetFps.load();
+        auto cb = onResChange;
+        lk.unlock();
+        if (cb) cb(newW, newH, fps);
+        return;
+    }
 
     int64_t ts = GetTimestamp();
     int64_t sourceTs = ConvertFrameSourceTimestampUs(f.SystemRelativeTime(), ts);
@@ -187,6 +196,50 @@ void ScreenCapture::OnFrame(WGC::Direct3D11CaptureFramePool const& s, winrt::Win
     slot->Push(texPool[ti], ts, sourceTs, fv, true, ti);
 }
 
+bool ScreenCapture::CreateTexturePool(int width, int height, ID3D11Texture2D* (&out)[POOL]) {
+    D3D11_TEXTURE2D_DESC td = {static_cast<UINT>(width), static_cast<UINT>(height), 1, 1, DXGI_FORMAT_B8G8R8A8_UNORM, {1, 0},
+                               D3D11_USAGE_DEFAULT, D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET,
+                               0, D3D11_RESOURCE_MISC_SHARED};
+    for (int i = 0; i < POOL; i++) {
+        if (FAILED(dev->CreateTexture2D(&td, nullptr, &out[i]))) {
+            for (auto& t : out) SafeRelease(t);
+            return false;
+        }
+    }
+    return true;
+}
+
+bool ScreenCapture::ResizeCaptureTargets(int newW, int newH) {
+    ID3D11Texture2D* nextPool[POOL]{};
+    if (!CreateTexturePool(newW, newH, nextPool)) {
+        ERR("Capture: Failed to create %dx%d texture pool for resize", newW, newH);
+        return false;
+    }
+
+    try {
+        pool.Recreate(winrtDev, WGD::DirectXPixelFormat::B8G8R8A8UIntNormalized, 4, {newW, newH});
+    } catch (...) {
+        ERR("Capture: Frame pool Recreate failed for %dx%d", newW, newH);
+        for (auto& t : nextPool) SafeRelease(t);
+        return false;
+    }
+
+    // Invalidate queued frames first; in-flight frames hold their own texture refs.
+    slot->SetGeneration(captureGen.fetch_add(1) + 1);
+    slot->Reset();
+    for (int i = 0; i < POOL; i++) {
+        SafeRelease(texPool[i]);
+        texPool[i] = nextPool[i];
+        texFences[i] = 0;
+    }
+    texIdx = 0;
+
+    LOG("Capture: Source resized %dx%d -> %dx%d", w.load(), h.load(), newW, newH);
+    w = newW;
+    h = newH;
+    return true;
+}
+
 void ScreenCapture::WaitCB(int ms) {
     auto st = steady_clock::now();
     while (cbActive.load() > 0 && duration_cast<milliseconds>(steady_clock::now() - st).count() < ms)
@@ -211,19 +264,16 @@ void ScreenCapture::InitMon(HMONITOR mon, bool keepFps) {
     w = item.Size().Width;
     h = item.Size().Height;
 
-    for (auto& t : texPool) SafeRelease(t);
-    for (auto& f : texFences) f = 0;
-
-    D3D11_TEXTURE2D_DESC td = {static_cast<UINT>(w), static_cast<UINT>(h), 1, 1, DXGI_FORMAT_B8G8R8A8_UNORM, {1, 0},
-                               D3D11_USAGE_DEFAULT, D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET,
-                               0, D3D11_RESOURCE_MISC_SHARED};
-
-    for (int i = 0; i < POOL; i++)
-        if (FAILED(dev->CreateTexture2D(&td, nullptr, &texPool[i])))
-            throw std::runtime_error("Texture pool failed");
+    ID3D11Texture2D* nextPool[POOL]{};
+    if (!CreateTexturePool(w, h, nextPool)) throw std::runtime_error("Texture pool failed");
+    for (int i = 0; i < POOL; i++) {
+        SafeRelease(texPool[i]);
+        texPool[i] = nextPool[i];
+        texFences[i] = 0;
+    }
 
     pool = WGC::Direct3D11CaptureFramePool::CreateFreeThreaded(
-        winrtDev, WGD::DirectXPixelFormat::B8G8R8A8UIntNormalized, 4, {w, h});
+        winrtDev, WGD::DirectXPixelFormat::B8G8R8A8UIntNormalized, 4, {w.load(), h.load()});
     pool.FrameArrived({this, &ScreenCapture::OnFrame});
     sess = pool.CreateCaptureSession(item);
     sess.IsCursorCaptureEnabled(cursorCapture);
@@ -339,7 +389,7 @@ ScreenCapture::ScreenCapture(FrameSlot* s) : slot(s) {
     RefreshMonitorList();
     cursorCapture = false;
     InitMon(MonitorFromPoint({0, 0}, MONITOR_DEFAULTTOPRIMARY));
-    LOG("Capture: %dx%d @ %dHz", w, h, hostFps);
+    LOG("Capture: %dx%d @ %dHz", w.load(), h.load(), hostFps);
 }
 
 ScreenCapture::~ScreenCapture() {
@@ -442,7 +492,7 @@ bool ScreenCapture::SwitchMonitor(int i) {
 
         InitMon(nextMon, true);
         monIdx = i;
-        if (onResChange) onResChange(w, h, targetFps.load());
+        if (onResChange) onResChange(w.load(), h.load(), targetFps.load());
         if (was) {
             sess.StartCapture();
             started = true;

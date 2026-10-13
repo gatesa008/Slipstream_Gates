@@ -123,6 +123,18 @@ const flushStreamTarget = () => {
     return sent;
 };
 
+// Every accepted target change costs a host encoder rebuild plus a keyframe, so wait for
+// resizes to settle and ignore changes small enough that browser scaling hides them.
+const STREAM_TARGET_SETTLE_MS = 300;
+const STREAM_TARGET_MIN_CHANGE = 0.04;
+
+const isMinorTargetChange = (width, height) => {
+    if (!sentStreamTarget.width || !sentStreamTarget.height) return false;
+    const dw = Math.abs(width - sentStreamTarget.width) / sentStreamTarget.width;
+    const dh = Math.abs(height - sentStreamTarget.height) / sentStreamTarget.height;
+    return dw < STREAM_TARGET_MIN_CHANGE && dh < STREAM_TARGET_MIN_CHANGE;
+};
+
 export const updateStreamTarget = (width, height, immediate = false) => {
     const nextWidth = Math.max(0, width | 0);
     const nextHeight = Math.max(0, height | 0);
@@ -133,7 +145,8 @@ export const updateStreamTarget = (width, height, immediate = false) => {
         return;
     }
     clearPendingStreamTarget();
-    pendingStreamTargetTimer = setTimeout(flushStreamTarget, 120);
+    if (isMinorTargetChange(nextWidth, nextHeight)) return;
+    pendingStreamTargetTimer = setTimeout(flushStreamTarget, STREAM_TARGET_SETTLE_MS);
 };
 
 export const resendStreamTarget = () => {

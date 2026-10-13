@@ -180,6 +180,26 @@ void WebRTCServer::SendVersion() {
     SendCtrl(buf.data(), buf.size());
 }
 
+void WebRTCServer::SendDesktopState() {
+    uint8_t buf[5]{};
+    WritePod<uint32_t>(buf, MSG_DESKTOP_STATE);
+    buf[4] = secureDesktop.load(std::memory_order_acquire) ? DESKTOP_SECURE : DESKTOP_NORMAL;
+    SendCtrl(buf, sizeof(buf));
+}
+
+void WebRTCServer::SetSecureDesktopActive(bool active) {
+    if (secureDesktop.exchange(active, std::memory_order_acq_rel) == active) return;
+    LOG("WebRTC: Host input desktop is now %s", active ? "secure (UAC/lock screen)" : "normal");
+    if (!active) needsKey.store(true, std::memory_order_release);
+    if (IsStreaming()) SendDesktopState();
+}
+
+void WebRTCServer::NotifyMonitorsChanged() {
+    if (!IsStreaming()) return;
+    SendMonitorList();
+    SendHostInfo();
+}
+
 void WebRTCServer::HandleCtrl(const rtc::binary& message) {
     if (message.size() < 4 || chRdy < NUM_CH) {
         if (message.size() < 4) WARN("WebRTC: HandleCtrl - message too small (%zu bytes)", message.size());
@@ -421,7 +441,7 @@ void WebRTCServer::OnChannelOpen(const std::string& label, uint64_t epoch) {
     conn = true; needsKey = true; lastPing = GetTimestamp() / 1000; overflow = 0;
     connCount++;
     LOG("WebRTC: Connection #%llu established (epoch=%llu)", connCount.load(), epoch);
-    SendHostInfo(); SendEncoderInfo(); SendCodecCaps(); SendMonitorList(); SendVersion();
+    SendHostInfo(); SendEncoderInfo(); SendCodecCaps(); SendMonitorList(); SendVersion(); SendDesktopState();
     if (callbacks_.onConnected) callbacks_.onConnected();
 }
 
@@ -758,7 +778,7 @@ bool WebRTCServer::Send(const EncodedFrame& frame) {
         static_cast<uint16_t>(chunkCount),
         0,
         static_cast<uint16_t>(DATA_CHUNK),
-        frame.isKey ? static_cast<uint8_t>(1) : static_cast<uint8_t>(0),
+        MakeVideoFrameType(frame.isKey, frame.codec),
         kPktData,
         fecGroupSize
     };

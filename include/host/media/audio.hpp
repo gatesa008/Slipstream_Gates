@@ -10,6 +10,7 @@
 #include <thread>
 #include <vector>
 #include <mmdeviceapi.h>
+#include <mmreg.h>
 #include <audioclient.h>
 #include <functiondiscoverykeys_devpkey.h>
 extern "C" {
@@ -37,7 +38,11 @@ class AudioCapture {
     WAVEFORMATEX* waveFormat = nullptr;
 
     int systemSampleRate = 48000;
-    int channelCount = 2;
+    int sourceChannelCount = 2;   // channels in the WASAPI mix format
+    int channelCount = 2;         // channels fed to Opus (stereo downmix when the mix has more)
+    std::vector<float> downmixGainL, downmixGainR;
+    std::vector<float> downmixBuffer;
+    std::wstring deviceId;
     std::unique_ptr<SpeexResampler> resampler;
     std::vector<int16_t> encodeBuffer;
     std::vector<uint8_t> opusBuffer;
@@ -47,11 +52,18 @@ class AudioCapture {
     std::atomic<bool> captureActive{false};
     std::atomic<bool> isInitialized{false};
     std::atomic<bool> streaming{false};
+    std::atomic<bool> resetRequested{false};
     std::thread captureThread;
     std::queue<AudioPacket> packetQueue;
     std::mutex queueMutex;
     std::condition_variable queueCv;
 
+    void OpenDevice();
+    void CloseDevice();
+    bool ReopenDevice(const char* reason);
+    [[nodiscard]] bool DefaultDeviceChanged();
+    void ConfigureDownmix();
+    const float* Downmix(const float* data, UINT32 frames);
     void Loop();
     void Process(const float* data, UINT32 frames, int64_t ts);
 
@@ -86,6 +98,7 @@ class MicPlayback {
     std::atomic<bool> running{false};
     std::atomic<bool> streaming{false};
     std::atomic<bool> init{false};
+    std::atomic<bool> resetRequested{false};
     std::thread playbackThread;
     std::queue<std::vector<uint8_t>> packetQueue;
     std::mutex queueMutex;

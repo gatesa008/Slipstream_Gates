@@ -9,6 +9,7 @@ struct EncodedFrame {
     std::vector<uint8_t> data;
     int64_t ts=0, sourceTs=0, encodeEndTs=0, enqueueTs=0, encUs=0;
     bool isKey=false;
+    CodecType codec=CODEC_H264;
     void Clear() { data.clear(); ts = sourceTs = encodeEndTs = enqueueTs = encUs = 0; isKey = false; }
 };
 
@@ -81,6 +82,9 @@ public:
 
     [[nodiscard]] GPUVendor GetVendor() const { return vendor; }
     [[nodiscard]] bool IsUsingHardware() const { return usingHardware; }
+    [[nodiscard]] CodecType GetCodec() const { return codec; }
+    [[nodiscard]] int GetWidth() const { return w; }
+    [[nodiscard]] int GetHeight() const { return h; }
     [[nodiscard]] const std::string& GetActiveEncoderName() const { return activeEncoderName; }
     bool UpdateFPS(int fps);
     void Flush();
