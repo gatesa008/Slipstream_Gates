@@ -139,10 +139,19 @@ const queueAbsMove = (x, y) => {
     scheduleFlush();
 };
 
-const queueRelMove = (dx, dy) => {
-    pendingRel.dx = Math.max(-32768, Math.min(32767, pendingRel.dx + dx));
-    pendingRel.dy = Math.max(-32768, Math.min(32767, pendingRel.dy + dy));
-    scheduleFlush();
+// Relative (pointer-locked / gaming) motion is latency-critical, so send each movement event
+// immediately rather than coalescing it to the client's rAF cadence (which added up to one
+// client frame, ~7 ms at 144 Hz / ~16 ms at 60 Hz, of input lag). Deltas are additive, so
+// per-event sends lose no motion; packets are 8 bytes, negligible bandwidth even at 1 kHz mice.
+// Absolute motion stays rAF-coalesced below: only the final cursor position matters there, so
+// collapsing to the latest avoids needless sends without adding meaningful latency.
+const sendRelMoveNow = (dx, dy) => {
+    if (!S.controlEnabled || S.dcInput?.readyState !== 'open') return;
+    S.stats.moves++;
+    mRelView.setInt16(4, Math.max(-32768, Math.min(32767, dx)), 1);
+    mRelView.setInt16(6, Math.max(-32768, Math.min(32767, dy)), 1);
+    const sent = safe(() => { S.dcInput.send(mRelBuf); return true; }, false, 'INPUT');
+    if (!sent) log.warn('INPUT', 'Rel move send failed');
 };
 const isInVideoViewport = (clientX, clientY) => {
     if (S.W <= 0 || S.H <= 0 || !canvas) return true;
@@ -333,7 +342,7 @@ const handlers = {
         if (S.relativeMouseMode && S.pointerLocked) {
             const dx = Math.round(e.movementX);
             const dy = Math.round(e.movementY);
-            if (dx || dy) queueRelMove(dx, dy);
+            if (dx || dy) sendRelMoveNow(dx, dy);
         } else if (!S.relativeMouseMode) {
             const pos = toNormalized(e.clientX, e.clientY);
             if (pos) queueAbsMove(pos.x, pos.y);
