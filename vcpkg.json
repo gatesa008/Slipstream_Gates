@@ -1,0 +1,15 @@
+{
+    "name": "slipstream",
+    "version": "1.0.0",
+    "dependencies": [
+        "libdatachannel",
+        "miniupnpc",
+        {"name": "cpp-httplib", "features": ["openssl"]},
+        "nlohmann-json",
+        "opus",
+        "openssl",
+        {"name": "ffmpeg", "features": ["nvcodec", "qsv","avcodec"]},
+        "jwt-cpp",
+        "speexdsp"
+    ]
+}

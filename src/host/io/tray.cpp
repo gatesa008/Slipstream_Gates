@@ -1,0 +1,202 @@
+#include "host/core/common.hpp"
+#include "host/core/app_support.hpp"
+#include "host/io/tray.hpp"
+#include <shellapi.h>
+
+namespace {
+constexpr UINT WM_TRAYICON = WM_APP + 1;
+constexpr UINT TRAY_ICON_ID = 1001;
+constexpr UINT IDM_TRAY_OPEN = 2001;
+constexpr UINT IDM_TRAY_EXIT = 2002;
+
+HWND g_consoleWnd = nullptr;
+HWND g_trayWnd = nullptr;
+HICON g_smallIcon = nullptr;
+HICON g_bigIcon = nullptr;
+
+HICON LoadAppIcon(int width, int height) {
+    return reinterpret_cast<HICON>(LoadImageW(
+        GetModuleHandleW(nullptr),
+        MAKEINTRESOURCEW(1),
+        IMAGE_ICON,
+        width,
+        height,
+        0));
+}
+
+void ApplyConsoleWindowIcons() {
+    if (!g_consoleWnd) return;
+
+    if (!g_smallIcon) {
+        g_smallIcon = LoadAppIcon(GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON));
+    }
+    if (!g_bigIcon) {
+        g_bigIcon = LoadAppIcon(GetSystemMetrics(SM_CXICON), GetSystemMetrics(SM_CYICON));
+    }
+
+    if (g_smallIcon) {
+        SendMessageW(g_consoleWnd, WM_SETICON, ICON_SMALL, reinterpret_cast<LPARAM>(g_smallIcon));
+        SetClassLongPtrW(g_consoleWnd, GCLP_HICONSM, reinterpret_cast<LONG_PTR>(g_smallIcon));
+    }
+    if (g_bigIcon) {
+        SendMessageW(g_consoleWnd, WM_SETICON, ICON_BIG, reinterpret_cast<LPARAM>(g_bigIcon));
+        SetClassLongPtrW(g_consoleWnd, GCLP_HICON, reinterpret_cast<LONG_PTR>(g_bigIcon));
+    }
+}
+
+void RestoreFromTray() {
+    if(!g_consoleWnd) return;
+    ShowWindow(g_consoleWnd, SW_RESTORE);
+    SetForegroundWindow(g_consoleWnd);
+}
+
+void DisableConsoleCloseButton() {
+    if(!g_consoleWnd) return;
+    if(HMENU m = GetSystemMenu(g_consoleWnd, FALSE))
+        { EnableMenuItem(m, SC_CLOSE, MF_BYCOMMAND|MF_GRAYED); DrawMenuBar(g_consoleWnd); }
+}
+
+void RequestFullExit() {
+    auto& app = GetAppContext();
+    if (app.exitRequested.exchange(true, std::memory_order_acq_rel)) {
+        return;
+    }
+
+    LOG("Tray: exit requested");
+    app.exitRequested.store(true, std::memory_order_release);
+    app.running.store(false, std::memory_order_release);
+
+    if (g_trayWnd && IsWindow(g_trayWnd)) {
+        PostMessageW(g_trayWnd, WM_CLOSE, 0, 0);
+    }
+    PostQuitMessage(0);
+}
+
+void ShowTrayMenu(HWND wnd) {
+    HMENU menu = CreatePopupMenu();
+    if(!menu) return;
+
+    AppendMenuW(menu, MF_STRING, IDM_TRAY_OPEN, L"Open SlipStream");
+    AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(menu, MF_STRING, IDM_TRAY_EXIT, L"Exit SlipStream");
+
+    POINT pt{};
+    GetCursorPos(&pt);
+    SetForegroundWindow(wnd);
+    TrackPopupMenu(menu, TPM_RIGHTBUTTON | TPM_BOTTOMALIGN | TPM_LEFTALIGN,
+                   pt.x, pt.y, 0, wnd, nullptr);
+    PostMessageW(wnd, WM_NULL, 0, 0);
+    DestroyMenu(menu);
+}
+
+LRESULT CALLBACK TrayWindowProc(HWND wnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    switch(msg) {
+        case WM_COMMAND:
+            switch(LOWORD(wParam)) {
+                case IDM_TRAY_OPEN:
+                    RestoreFromTray();
+                    return 0;
+                case IDM_TRAY_EXIT:
+                    RequestFullExit();
+                    return 0;
+            }
+            break;
+        case WM_TRAYICON:
+            if ((LOWORD(wParam) == TRAY_ICON_ID || HIWORD(lParam) == TRAY_ICON_ID) &&
+                (LOWORD(lParam) == WM_RBUTTONUP || LOWORD(lParam) == WM_CONTEXTMENU))
+                { ShowTrayMenu(wnd); return 0; }
+            break;
+        case WM_DESTROY:
+            PostQuitMessage(0);
+            return 0;
+    }
+    return DefWindowProcW(wnd, msg, wParam, lParam);
+}
+
+}
+
+bool InitAppTray() {
+    g_consoleWnd = GetConsoleWindow();
+    ApplyConsoleWindowIcons();
+
+    const wchar_t* clsName = L"SlipStreamTrayWindowClass";
+    WNDCLASSEXW wc{};
+    wc.cbSize = sizeof(wc);
+    wc.lpfnWndProc = TrayWindowProc;
+    wc.hInstance = GetModuleHandleW(nullptr);
+    wc.lpszClassName = clsName;
+
+    if(!RegisterClassExW(&wc) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS) {
+        ERR("Tray: RegisterClassExW failed: %lu", GetLastError());
+        return false;
+    }
+
+    g_trayWnd = CreateWindowExW(0, clsName, L"SlipStreamTray", WS_OVERLAPPED,
+                                0, 0, 0, 0, nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
+    if(!g_trayWnd) {
+        ERR("Tray: CreateWindowExW failed: %lu", GetLastError());
+        return false;
+    }
+
+    HICON icon = g_smallIcon ? g_smallIcon : reinterpret_cast<HICON>(LoadImageW(GetModuleHandleW(nullptr), MAKEINTRESOURCEW(1), IMAGE_ICON, 0, 0, LR_DEFAULTSIZE));
+    if(!icon) icon = LoadIconW(nullptr, MAKEINTRESOURCEW(32512));
+
+    NOTIFYICONDATAW nid{};
+    nid.cbSize = sizeof(nid); nid.hWnd = g_trayWnd; nid.uID = TRAY_ICON_ID;
+    nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP | NIF_SHOWTIP;
+    nid.uCallbackMessage = WM_TRAYICON; nid.hIcon = icon;
+    wcscpy_s(nid.szTip, L"SlipStream");
+
+    if(!Shell_NotifyIconW(NIM_ADD, &nid)) {
+        ERR("Tray: Shell_NotifyIconW(NIM_ADD) failed");
+        DestroyWindow(g_trayWnd);
+        g_trayWnd = nullptr;
+        return false;
+    }
+
+    nid.uVersion = NOTIFYICON_VERSION_4;
+    Shell_NotifyIconW(NIM_SETVERSION, &nid);
+    DisableConsoleCloseButton();
+    HideAppToTray();
+    return true;
+}
+
+bool PumpAppTrayMessages() {
+    MSG msg;
+    while(PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
+        if (msg.message == WM_QUIT) {
+            GetAppContext().running.store(false, std::memory_order_release);
+            return false;
+        }
+        TranslateMessage(&msg);
+        DispatchMessageW(&msg);
+    }
+
+    if(g_consoleWnd && IsWindow(g_consoleWnd) && IsWindowVisible(g_consoleWnd) && IsIconic(g_consoleWnd)) {
+        HideAppToTray();
+    }
+
+    return true;
+}
+
+void HideAppToTray() {
+    if(g_consoleWnd) ShowWindow(g_consoleWnd, SW_HIDE);
+}
+
+void CleanupAppTray() {
+    if(!g_trayWnd) return;
+    NOTIFYICONDATAW nid{};
+    nid.cbSize = sizeof(nid); nid.hWnd = g_trayWnd; nid.uID = TRAY_ICON_ID;
+    Shell_NotifyIconW(NIM_DELETE, &nid);
+    DestroyWindow(g_trayWnd);
+    g_trayWnd = nullptr;
+
+    if (g_smallIcon) {
+        DestroyIcon(g_smallIcon);
+        g_smallIcon = nullptr;
+    }
+    if (g_bigIcon) {
+        DestroyIcon(g_bigIcon);
+        g_bigIcon = nullptr;
+    }
+}

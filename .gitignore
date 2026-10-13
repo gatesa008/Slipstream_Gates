@@ -1,0 +1,8 @@
+﻿slipstream-debug.log
+slipstream-debug2.log
+slipstream-crash.txt
+PktMon.etl
+*.bak
+build/
+bin/
+obj/
