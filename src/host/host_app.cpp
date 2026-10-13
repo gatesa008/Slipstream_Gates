@@ -42,6 +42,9 @@ T SafeCall(const char* context, T fallback, F&& fn) {
 constexpr int kHttpsPort = 8443;
 constexpr int64_t kFallbackFramePeriodUs = 16667;
 constexpr int kEncodeSizeQuantum = 8;
+// Low-latency pacing lets a frame that is slightly ahead of the rate cap encode anyway, rather
+// than dropping it over a sub-millisecond margin and waiting for the next one.
+constexpr int64_t kPacingToleranceUs = 1000;
 
 int AlignEncodeDimension(int value, int maxValue) {
     if (maxValue <= 0) return 0;
@@ -464,7 +467,8 @@ std::thread StartEncoderThread(
     std::unique_ptr<VideoEncoder>& encoder,
     std::atomic<bool>& encoderReady,
     std::atomic<int64_t>& lastEncodeTs,
-    std::atomic<int>& targetFps) {
+    std::atomic<int>& targetFps,
+    std::atomic<bool>& lowLatencyPacing) {
     return std::thread([&] {
         SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
 
@@ -476,6 +480,8 @@ std::thread StartEncoderThread(
 
         int64_t framePeriodUs = kFallbackFramePeriodUs;
         int64_t nextTs = 0;
+        // Wall-clock of the last encode, used only by the low-latency pacing path as a rate limiter.
+        int64_t llLastEncodeUs = 0;
         uint64_t lastGeneration = frameSlot.GetGeneration();
 
         auto freePending = [&] { frameSlot.MarkReleased(pendingFrame.poolIdx, pendingFrame.generation); pendingFrame.Release(); hasPendingFrame = false; };
@@ -596,7 +602,7 @@ std::thread StartEncoderThread(
 
             if (needsKeyFrame) {
                 if (hasPendingFrame) freePending();
-                if (encodeAndSend(currentFrame, true)) nextTs = currentFrame.ts + framePeriodUs;
+                if (encodeAndSend(currentFrame, true)) { nextTs = currentFrame.ts + framePeriodUs; llLastEncodeUs = GetTimestamp(); }
                 freeCurrent();
                 continue;
             }
@@ -629,6 +635,31 @@ std::thread StartEncoderThread(
                 DBG("EncoderThread: Frame too old (ts=%lld nextTs=%lld delta=%lld framePeriod=%lld) - dropping",
                     currentFrame.ts, nextTs, currentFrame.ts - nextTs, framePeriodUs);
                 freeCurrent();
+                continue;
+            }
+
+            // --- Low-latency pacing (experimental, runtime toggle; control = scheduler below) ---
+            // Rate-limit from the last actual encode and always encode the freshest frame, with no
+            // cadence alignment and no extra half-period hold. Frames arrive FIFO from the slot, so
+            // we keep the newest as pending and encode it as soon as the rate slot opens. This
+            // removes the control scheduler's up-to-half-a-frame cadence wait; the cost is slightly
+            // less even spacing (watch the jitter Std Dev in the overlay when comparing).
+            if (lowLatencyPacing.load(std::memory_order_acquire)) {
+                if (hasPendingFrame) freePending();   // newest wins; FIFO means currentFrame supersedes
+                promoteCurrent();
+                const int64_t nowUs = GetTimestamp();
+                const int64_t elapsed = llLastEncodeUs == 0 ? framePeriodUs : nowUs - llLastEncodeUs;
+                if (elapsed + kPacingToleranceUs >= framePeriodUs) {
+                    if (pendingFrame.generation != frameSlot.GetGeneration()) { freePending(); continue; }
+                    if (now - pendingFrame.ts > framePeriodUs * 2) {   // too stale to be worth sending
+                        freePending();
+                        continue;
+                    }
+                    encodeAndSend(pendingFrame, false);
+                    llLastEncodeUs = GetTimestamp();
+                    freePending();
+                }
+                // else: hold the freshest frame; the next pop re-evaluates once the slot opens.
                 continue;
             }
 
@@ -756,6 +787,7 @@ bool StartWorkerThreads(
     std::atomic<bool>& encoderReady,
     std::atomic<int64_t>& lastEncodeTs,
     std::atomic<int>& targetFps,
+    std::atomic<bool>& lowLatencyPacing,
     std::unique_ptr<AudioCapture>& audioCapture,
     WorkerThreads& threads) {
     const bool bound = server.bind_to_port("0.0.0.0", kHttpsPort);
@@ -821,7 +853,8 @@ bool StartWorkerThreads(
         encoder,
         encoderReady,
         lastEncodeTs,
-        targetFps);
+        targetFps,
+        lowLatencyPacing);
 
     return true;
 }
@@ -918,6 +951,11 @@ int RunHostApp(int argc, char* argv[]) {
         std::atomic<bool> cursorCapture{false};
         std::atomic<int64_t> lastEncodeTs{0};
         std::atomic<int> targetFps{60};
+        // Experimental low-latency encoder pacing. Off by default (the cadence scheduler is the
+        // control); set SLIPSTREAM_LOWLATENCY_PACING=1 to A/B it. Read per-frame so it can also be
+        // flipped at runtime by a future control hook without restarting the stream.
+        std::atomic<bool> lowLatencyPacing{GetEnvBool("SLIPSTREAM_LOWLATENCY_PACING", false)};
+        LOG("Encoder pacing: %s", lowLatencyPacing.load() ? "low-latency (experimental)" : "cadence scheduler (default)");
         // Bumped whenever streaming state is torn down so an in-progress rebuild can tell it is stale.
         std::atomic<uint64_t> streamEpoch{0};
         // Serializes encoder construction. Never held together with encoderMutex while building,
@@ -1170,6 +1208,7 @@ int RunHostApp(int argc, char* argv[]) {
             encoderReady,
             lastEncodeTs,
             targetFps,
+            lowLatencyPacing,
             audioCapture,
             threads)) {
             return 1;

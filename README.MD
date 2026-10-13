@@ -248,6 +248,20 @@ To use custom certificates, replace `%APPDATA%\SlipStream\server.crt` and `%APPD
 | Cursor | Optional capture in stream |
 | Border | Disabled (if OS supports) |
 
+### Encoder Pacing
+
+The encoder thread normally paces output to the target frame rate with a cadence scheduler that
+keeps inter-frame spacing even. An experimental low-latency pacing mode rate-limits from the last
+encode and always encodes the freshest captured frame with no cadence hold, trading a little
+spacing evenness for lower latency.
+
+- Set `SLIPSTREAM_LOWLATENCY_PACING=1` before launch to enable it. Default (`0`) keeps the cadence
+  scheduler. The value is read per frame, so it is also a hook for a future runtime switch.
+- Compare the two with the on-screen stats overlay (enable **Debug stats** in the panel): watch
+  the `E2E STAGES` rows and the `JITTER` Std Dev. Lower latency should show with similar or only
+  slightly higher Std Dev; a large Std Dev increase means the cadence scheduler is the better fit
+  for that content.
+
 ### GPU Vendor Detection
 
 The encoder automatically detects the GPU vendor and selects the appropriate encoder:
