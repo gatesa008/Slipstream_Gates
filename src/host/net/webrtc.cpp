@@ -318,6 +318,26 @@ void WebRTCServer::HandleInput(const rtc::binary& message) {
         return;
     }
 
+    // Input-latency probe: echo the client's timestamp straight back on the input channel so the
+    // client can measure input-channel round trip without injecting anything. Measured round trip,
+    // not a one-way or motion-to-photon figure.
+    const uint32_t inputMsgType = ReadPod<uint32_t>(reinterpret_cast<const uint8_t*>(message.data()));
+    if (inputMsgType == MSG_INPUT_PING) {
+        if (message.size() == 12) {
+            std::shared_ptr<rtc::DataChannel> inputChannel;
+            { std::lock_guard<std::mutex> lk(channelMutex_); inputChannel = inputDataChannel_; }
+            if (inputChannel && inputChannel->isOpen()) {
+                uint8_t reply[20];
+                WritePod<uint32_t>(reply, MSG_INPUT_PONG);
+                std::memcpy(reply + 4, message.data() + 4, 8);                        // echo client send ts
+                WritePod<uint64_t>(reply + 12, static_cast<uint64_t>(GetTimestamp())); // host recv ts
+                try { inputChannel->send(reinterpret_cast<const std::byte*>(reply), sizeof(reply)); }
+                catch (...) { DBG("WebRTC: input pong send failed"); }
+            }
+        }
+        return;
+    }
+
     inputRecv++;
     const bool handled = callbacks_.input->HandleMessage(reinterpret_cast<const uint8_t*>(message.data()), message.size());
     if (!handled) {

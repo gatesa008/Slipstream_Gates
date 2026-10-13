@@ -2,7 +2,7 @@
 import { enableControl, disableControl } from './input.js';
 import { MSG, C, PROTOCOL_VERSION } from './constants.js';
 import { S, $, safe, updateClockOffset, resetClockSync,
-    startMetricsLogger, stopMetricsLogger, resetSessionStats, recordPacket,
+    startMetricsLogger, stopMetricsLogger, resetSessionStats, recordPacket, recordInputRtt,
     clientTimeUs, logVideoDrop, logAudioDrop, logNetworkDrop, log, bus } from './state.js';
 import { handleAudioPacket, closeAudio, initDecoder, decodeFrame, stopKeyframeRetry, resetVideoDecoderState } from './media.js';
 import { updateMonOpts, updateCodecOpts, updateCodecDropdown, setHostCodecs,
@@ -13,7 +13,7 @@ import { stopMic } from './mic.js';
 import { showAuth, clearSession, validateSession } from './auth.js';
 import { sendPing, requestKeyframe, requestRecoveryKeyframe, clearPendingKeyReq,
     applyCodec, applyFps, getMaxInFlightFrames, expectedChunkSize,
-    resendStreamTarget,
+    resendStreamTarget, sendInputPing,
     tryRecoverFrameGroup, resetProtocolState } from './protocol.js';
 
 const BASE_URL = location.origin;
@@ -750,12 +750,22 @@ const handleAudio = e => {
 };
 
 // --- Channel lifecycle ---
+// Input-channel latency probe reply (see host HandleInput). Round trip is measured directly from
+// the echoed client timestamp; no clock sync, and it is not motion-to-photon.
+const handleInputChannel = e => {
+    if (!(e.data instanceof ArrayBuffer) || e.data.byteLength !== 20) return;
+    const view = new DataView(e.data);
+    if (view.getUint32(0, true) !== MSG.INPUT_PONG) return;
+    const clientSendUs = Number(view.getBigUint64(4, true));
+    recordInputRtt((clientTimeUs() - clientSendUs) / 1000);
+};
+
 const DC_KEYS = ['dcControl', 'dcVideo', 'dcAudio', 'dcInput', 'dcMic'];
 const DC_CONFIG = [
     ['dcControl', 'control', C.DC_CONTROL, handleControl],
     ['dcVideo', 'video', C.DC_VIDEO, handleVideo],
     ['dcAudio', 'audio', C.DC_AUDIO, handleAudio],
-    ['dcInput', 'input', C.DC_INPUT, () => {}],
+    ['dcInput', 'input', C.DC_INPUT, handleInputChannel],
     ['dcMic', 'mic', C.DC_MIC, () => {}]
 ];
 
@@ -778,7 +788,7 @@ const onAllChannelsOpen = async connectSeq => {
     resendStreamTarget();
     clearPing();
     startMetricsLogger();
-    pingInterval = setInterval(sendPing, C.PING_MS);
+    pingInterval = setInterval(() => { sendPing(); sendInputPing(); }, C.PING_MS);
 };
 
 const onChannelClose = (connectSeq, label) => {

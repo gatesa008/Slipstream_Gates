@@ -429,7 +429,7 @@ const STATS_SCHEMA = [
     { id: 'statsDropsSection', label: 'DROPS', warn: true, rows: [['Dropped', 'statsDropsDropped'], ['Timeout', 'statsDropsTimeout'], ['Late', 'statsDropsLate'], ['Decode Err', 'statsDecodeErrors']] },
     { label: 'AUDIO', rows: [['Packets', 'statsAudioPackets'], ['Decoded', 'statsAudioDecoded'], ['Buffer', 'statsAudioBuffer']] },
     { id: 'statsAudioDropsSection', label: 'AUDIO DROPS', warn: true, rows: [['Dropped', 'statsAudioDropped'], ['Underruns', 'statsAudioUnderruns'], ['Overflows', 'statsAudioOverflows']] },
-    { label: 'INPUT', rows: [['Mouse', 'statsInputMouse'], ['Keys', 'statsInputKeys']] },
+    { label: 'INPUT', rows: [['Mouse', 'statsInputMouse'], ['Keys', 'statsInputKeys'], ['In RTT', 'statsInputRtt']] },
     { label: 'SESSION', rows: [['Uptime', 'statsUptime'], ['Total Frames', 'statsTotalFrames'], ['Total Data', 'statsTotalData']] },
     { label: 'VERSION', rows: [['Host', 'statsHostVersion']] }
 ];
@@ -509,6 +509,7 @@ const updateStats = data => {
         statsAudioBuffer: formatValue(audio.avgBufferHealth, 1, ' ms'),
         statsInputMouse: `${stats.moves} moves, ${stats.clicks} clicks`,
         statsInputKeys: stats.keys.toString(),
+        statsInputRtt: data.inputLat.samples > 0 || data.inputLat.lastRttMs >= 0 ? formatValue(data.inputLat.avgRttMs >= 0 ? data.inputLat.avgRttMs : data.inputLat.lastRttMs, 1, ' ms') : '-- ms',
         statsUptime: formatUptime(data.uptime),
         statsTotalFrames: session.totalFrames.toLocaleString(),
         statsTotalData: `${(session.totalBytes / 1048576).toFixed(2)} MB`,

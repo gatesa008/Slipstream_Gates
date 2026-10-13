@@ -114,6 +114,7 @@ export const detectCodecs = async () => {
     codecCache = { support: sup, best };
     return codecCache;
 };
+const mkInputLatency = () => ({ rttSum: 0, rttCount: 0, lastRttMs: -1 });
 const mkClockSync = () => ({ ...zeroMetric('offset', 'valid', 'sampleCount', 'avgRttUs'), offsetSamples: [], rttSamples: [] });
 const mkJitter = () => {
     const metric = { ...zeroMetric('framesDroppedLate', 'lastPresentTs', 'intervalStdDev', 'intervalMean'), presentIntervals: [] };
@@ -143,6 +144,7 @@ export const S = {
     networkMetrics: mkNetwork(), decodeMetrics: mkDecode(),
     renderMetrics: mkRender(), audioMetrics: mkAudio(),
     micMetrics: mkMic(), micEnabled: 0, micStream: null,
+    inputLatency: mkInputLatency(),
     hostVersion: null
 };
 export const $ = id => document.querySelector(`#${id}`);
@@ -293,6 +295,21 @@ const addLatencySample = (metrics, sumKey, countKey, value) => {
     metrics[countKey]++;
 };
 
+// Input-channel round trip (measured): client send -> host echo -> client, no clock sync.
+export const recordInputRtt = ms => {
+    const m = S.inputLatency;
+    if (!Number.isFinite(ms) || ms < 0 || ms > 5000) return;
+    m.rttSum += ms; m.rttCount++; m.lastRttMs = ms;
+};
+const resetInputLatency = () => {
+    const m = S.inputLatency;
+    const result = { avgRttMs: m.rttCount ? m.rttSum / m.rttCount : -1, lastRttMs: m.lastRttMs, samples: m.rttCount };
+    // Keep lastRttMs so the overlay holds a value between sample windows.
+    S.inputLatency = mkInputLatency();
+    S.inputLatency.lastRttMs = result.lastRttMs;
+    return result;
+};
+
 export const recordVideoLatencySample = sample => {
     const m = S.jitterMetrics;
     for (const [prefix, , sampleKey] of JITTER_STAGE_FIELDS) {
@@ -334,6 +351,7 @@ export const startMetricsLogger = () => {
         const jitter = resetJitterMetrics();
         const clock = getClockSyncStats();
         const [network, decode, render, audio, mic] = [resetNetworkMetrics, resetDecodeMetrics, resetRenderMetrics, resetAudioMetrics, resetMicMetrics].map(reset => reset());
+        const inputLat = resetInputLatency();
 
         sesFrames += stats.framesComplete;
         sesBytes += stats.bytes;
@@ -348,7 +366,7 @@ export const startMetricsLogger = () => {
             mbps: (stats.bytes * 8 / 1048576).toFixed(2)
         };
 
-        const payload = { uptime, stats, jitter, clock, network, decode, render, audio, mic, session, computed };
+        const payload = { uptime, stats, jitter, clock, network, decode, render, audio, mic, inputLat, session, computed };
 
         metricsSubs.forEach(cb => {
             try { cb(payload); }

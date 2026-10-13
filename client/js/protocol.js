@@ -25,6 +25,14 @@ const sendStreamTarget = (width, height, options) => mkCtrlMsg(MSG.STREAM_TARGET
     v.setUint16(6, height, true);
 }, options);
 
+export const sendInputPing = () => {
+    if (S.dcInput?.readyState !== 'open') return;
+    S.dcInput.send(mkBuf(12, v => {
+        v.setUint32(0, MSG.INPUT_PING, true);
+        v.setBigUint64(4, BigInt(clientTimeUs()), true);
+    }));
+};
+
 export const sendPing = () => {
     if (S.dcControl?.readyState !== 'open') return;
     S.dcControl.send(mkBuf(16, v => {
