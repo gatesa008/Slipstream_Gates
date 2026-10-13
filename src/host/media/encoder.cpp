@@ -319,19 +319,19 @@ uint8_t VideoEncoder::ProbeSupport(ID3D11Device* device) {
     return support;
 }
 
-uint8_t VideoEncoder::ProbeHardwareSupport(ID3D11Device* device) {
+uint8_t VideoEncoder::ProbeHardwareSupport(ID3D11Device* device, ID3D11DeviceContext* context, ID3D11Multithread* multithread) {
+    // FFmpeg builds usually include every vendor's encoder, so "compiled in" says nothing about
+    // the GPU (e.g. av1_nvenc exists on RTX 30-series, which has no AV1 encoder). Open a real
+    // session per codec, hardware only.
+    constexpr int kProbeW = 1280, kProbeH = 720, kProbeFps = 60;
     uint8_t support = 0;
-    GPUVendor detected = DetectGPU(device);
-
     for (int c = 0; c <= 2; c++) {
         const CodecType codec = static_cast<CodecType>(c);
-        for (GPUVendor v : GetVendorPriority(detected)) {
-            if (auto* name = GetEncName(codec, v)) {
-                if (avcodec_find_encoder_by_name(name)) {
-                    support |= (1 << c);
-                    break;
-                }
-            }
+        try {
+            VideoEncoder probe(kProbeW, kProbeH, kProbeFps, device, context, multithread, codec, false);
+            if (probe.IsUsingHardware()) support |= (1 << c);
+        } catch (const std::exception& e) {
+            DBG("VideoEncoder: No hardware %s encoder: %s", CodecName(codec), e.what());
         }
     }
 
@@ -427,7 +427,9 @@ void VideoEncoder::Configure() {
             set("rc-lookahead", "0"); set("rc", "vbr"); set("multipass", "disabled");
             set("delay", "0"); set("surfaces", "3"); set("cq", quality);
             set("no-scenecut", "1");
-            if (codec != CODEC_AV1) { set("forced-idr", "1"); }
+            // Recovery keyframes must be real IDR/key frames, or the client keeps waiting.
+            // Older av1_nvenc builds lack the option; av_opt_set then just logs and skips it.
+            set("forced-idr", "1");
             break;
         case GPUVendor::INTEL:
             set("preset", "veryfast"); set("look_ahead", "0");
@@ -878,7 +880,7 @@ bool VideoEncoder::DrainPackets(bool& gotKey) {
 }
 
 VideoEncoder::VideoEncoder(int width, int height, int fps, ID3D11Device* d,
-                           ID3D11DeviceContext* c, ID3D11Multithread* m, CodecType cc)
+                           ID3D11DeviceContext* c, ID3D11Multithread* m, CodecType cc, bool allowSoftware)
     : w(width), h(height), curFps(fps), dev(d), ctx(c), mt(m), codec(cc) {
     LOG("VideoEncoder: Creating %dx%d @ %dfps, codec: %s", w, h, fps, CodecName(cc));
 
@@ -893,9 +895,14 @@ VideoEncoder::VideoEncoder(int width, int height, int fps, ID3D11Device* d,
         if (TryInitHardware(v, cc)) break;
     }
 
-    if (!cctx) TryInitSoftware(cc);
+    if (!cctx && allowSoftware) TryInitSoftware(cc);
 
-    if (!cctx) throw std::runtime_error("No encoder available for requested codec");
+    if (!cctx) {
+        // The destructor does not run for a throwing constructor; drop the refs taken above.
+        SafeRelease(mt, ctx, dev);
+        throw std::runtime_error(allowSoftware ? "No encoder available for requested codec"
+                                               : "No hardware encoder available for requested codec");
+    }
 
     pkt = av_packet_alloc();
     if (!pkt) throw std::runtime_error("Frame/packet alloc failed");
@@ -1064,6 +1071,7 @@ EncodedFrame* VideoEncoder::Encode(ID3D11Texture2D* tex, int64_t ts, int64_t sou
     out.encUs = ((t1.QuadPart - t0.QuadPart) * 1000000) / freq;
     out.isKey = gotKey;
     out.codec = codec;
+    out.generation = generation;
     totalFrames++;
 
     if (gotKey) {

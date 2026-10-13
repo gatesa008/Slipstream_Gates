@@ -466,11 +466,13 @@ void WebRTCServer::SetupChannel(std::shared_ptr<rtc::DataChannel>& channel, bool
     LOG("WebRTC: Setup channel '%s' (epoch=%llu)", label.c_str(), epoch);
 
     channel->setBufferedAmountLowThreshold(BUF_LOW);
-    channel->onOpen([this, label, epoch] { OnChannelOpen(label, epoch); });
-    channel->onClosed([this, label, epoch] { OnChannelClose(label, epoch); });
+    channel->onOpen([this, label, epoch] { CallbackGuard g(*this); if (g.active) OnChannelOpen(label, epoch); });
+    channel->onClosed([this, label, epoch] { CallbackGuard g(*this); if (g.active) OnChannelClose(label, epoch); });
     channel->onError([label](std::string e) { ERR("WebRTC: Channel '%s' error: %s", label.c_str(), e.c_str()); });
     if (handler) {
-        channel->onMessage([handler](auto payload) {
+        channel->onMessage([this, handler](auto payload) {
+            CallbackGuard g(*this);
+            if (!g.active) return;
             if (auto* binary = std::get_if<rtc::binary>(&payload)) handler(*binary);
         });
     }
@@ -587,6 +589,8 @@ void WebRTCServer::SetupPeerConnection() {
         descriptionCv_.notify_all();
     });
     newPc->onStateChange([this, epoch](auto s) {
+        CallbackGuard g(*this);
+        if (!g.active) return;
         LOG("WebRTC: Peer state=%s (epoch=%llu active=%llu ch=%d fpsRecv=%d conn=%d)",
             ToPeerStateString(s), epoch, peerEpoch.load(), chRdy.load(), fpsRecv.load() ? 1 : 0, conn.load() ? 1 : 0);
         if (epoch != peerEpoch.load()) {
@@ -679,7 +683,20 @@ WebRTCServer::WebRTCServer() {
 
 WebRTCServer::~WebRTCServer() { LogStats(); Reset(); }
 void WebRTCServer::Init(WebRTCCallbacks c) { callbacks_ = std::move(c); }
-void WebRTCServer::Shutdown() { Reset(); }
+void WebRTCServer::Shutdown() {
+    // Host callbacks capture RunHostApp locals by reference. Refuse new callbacks, then wait for
+    // the in-flight ones (an encoder rebuild for a codec change can take a moment) before the
+    // caller starts tearing those locals down.
+    stopping_.store(true, std::memory_order_release);
+    const auto deadline = std::chrono::steady_clock::now() + 5s;
+    while (callbacksInFlight_.load(std::memory_order_acquire) > 0 && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(5ms);
+    }
+    if (callbacksInFlight_.load(std::memory_order_acquire) > 0) {
+        WARN("WebRTC: Shutdown proceeding with %d callback(s) still running", callbacksInFlight_.load());
+    }
+    Reset();
+}
 
 std::string WebRTCServer::GetLocal() {
     std::unique_lock<std::mutex> lk(descriptionMutex_);
@@ -711,6 +728,8 @@ std::string WebRTCServer::GetLocal() {
 }
 void WebRTCServer::SetRemote(const std::string& sdp, const std::string& type) {
     LOG("WebRTC: SetRemote (type=%s)", type.c_str());
+    CallbackGuard g(*this);
+    if (!g.active) return;
     if (type == "offer") SetupPeerConnection();
     std::shared_ptr<rtc::PeerConnection> localPc;
     { std::lock_guard<std::mutex> lk(channelMutex_); localPc = peerConnection_; }
@@ -778,7 +797,7 @@ bool WebRTCServer::Send(const EncodedFrame& frame) {
         static_cast<uint16_t>(chunkCount),
         0,
         static_cast<uint16_t>(DATA_CHUNK),
-        MakeVideoFrameType(frame.isKey, frame.codec),
+        MakeVideoFrameType(frame.isKey, frame.codec, frame.generation),
         kPktData,
         fecGroupSize
     };

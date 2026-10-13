@@ -4,7 +4,7 @@ import { S, $, mkBuf, log, safe, safeAsync,
     recordDecodeTime, recordAudioPacket, recordAudioDecoded, recordAudioBufferHealth,
     recordAudioUnderrun, recordAudioOverflow, logVideoDrop, logAudioDrop } from './state.js';
 import { queueFrameForPresentation } from './renderer.js';
-import { requestKeyframe, requestRecoveryKeyframe, sendAudioEnable, handleDecodePressure } from './protocol.js';
+import { requestKeyframe, requestRecoveryKeyframe, sendAudioEnable, handleDecodePressure, requestCodecFallback } from './protocol.js';
 let kfRetryInterval = null;
 let lastCaptureTs = 0;
 let workletNode = null;
@@ -156,6 +156,7 @@ export const initDecoder = async (force = false, codecId = S.currentCodec) => {
     S.ready = 0;
     S.needKey = 1;
     S.decoderCodec = codecId;
+    S.decoderGeneration = null;
     lastCaptureTs = 0;
     decodeQueuePressureCount = 0;
     lastDecodeQueuePressureAt = 0;
@@ -176,6 +177,7 @@ export const initDecoder = async (force = false, codecId = S.currentCodec) => {
         S.hwAccel = 'NONE';
         log.error('MEDIA', 'Decoder configuration failed', { codec });
         logVideoDrop('Decoder configuration failed', { codec });
+        requestCodecFallback(codecId);
         return;
     }
 
@@ -186,6 +188,7 @@ export const initDecoder = async (force = false, codecId = S.currentCodec) => {
         S.hwAccel = 'NONE';
         log.error('MEDIA', 'Decoder configuration failed', { codec, state: decoder.state });
         logVideoDrop('Decoder configuration failed', { codec });
+        requestCodecFallback(codecId);
         return;
     }
 
@@ -204,6 +207,7 @@ export const resetVideoDecoderState = () => {
     decoderInitSeq++;
     pendingKeyframe = null;
     S.decoderCodec = null;
+    S.decoderGeneration = null;
 };
 
 export const decodeFrame = data => {
@@ -211,6 +215,18 @@ export const decodeFrame = data => {
     // stale frames from the old codec are dropped and the first new keyframe is kept.
     const frameCodec = data.codec ?? S.decoderCodec ?? S.currentCodec;
     if (frameCodec !== S.decoderCodec) {
+        // Only a keyframe may switch codecs. A stray delta is either a straggler from the codec
+        // we just left (tearing the new decoder down for it would thrash) or the new codec's
+        // keyframe was lost, in which case ask for another.
+        if (!data.isKey && S.decoderCodec != null) {
+            const now = performance.now();
+            if (now - lastWaitingKeyLogAt >= 1000) {
+                logVideoDrop('Delta frame for another codec', { frameCodec, decoderCodec: S.decoderCodec });
+                lastWaitingKeyLogAt = now;
+            }
+            if (frameCodec === S.currentCodec) requestKeyframe('codec-mismatch');
+            return false;
+        }
         if (data.isKey) pendingKeyframe = { ...data, codec: frameCodec };
         log.info('MEDIA', 'Stream codec changed - switching decoder', { from: S.decoderCodec, to: frameCodec, isKey: data.isKey ? 1 : 0 });
         S.currentCodec = frameCodec;
@@ -225,6 +241,13 @@ export const decodeFrame = data => {
         }
         logVideoDrop('Decoder not ready', { decoderState: S.decoder?.state, needKey: S.needKey });
         return false;
+    }
+
+    // Same codec, different encoder instance (resize rebuild): its deltas reference frames the
+    // decoder never saw. Only a keyframe from the new instance may start it.
+    if (data.generation != null && S.decoderGeneration != null && data.generation !== S.decoderGeneration && !data.isKey) {
+        if (!S.needKey) log.info('MEDIA', 'Encoder generation changed - waiting for its keyframe', { from: S.decoderGeneration, to: data.generation });
+        S.needKey = 1;
     }
 
     if (!data.isKey && S.needKey) {
@@ -297,6 +320,9 @@ export const decodeFrame = data => {
         });
         S.decoder.decode(chunk);
 
+        if (data.generation != null && (data.isKey || S.decoderGeneration === null)) S.decoderGeneration = data.generation;
+        // Set here, not in processFrame, so a keyframe decoded from the init stash counts too.
+        if (Number.isFinite(data.frameId) && data.frameId > S.lastDecodedFrameId) S.lastDecodedFrameId = data.frameId;
         if (data.isKey) {
             S.needKey = 0;
             lastWaitingKeyLogAt = 0;

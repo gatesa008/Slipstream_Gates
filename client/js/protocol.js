@@ -186,6 +186,22 @@ export const handleDecodePressure = ({ queueSize } = {}) => {
     }
 };
 
+// The browser claimed support during detection but configure() failed (driver/GPU process
+// quirk): ask the host for the next codec both sides can do, H.264 first as the safest.
+const failedDecoderCodecs = new Set();
+export const requestCodecFallback = failedCodecId => {
+    failedDecoderCodecs.add(failedCodecId);
+    const caps = S.hostCodecs || 0;
+    const next = [2, 1, 0].find(id => (caps & (1 << id)) && !failedDecoderCodecs.has(id));
+    if (next === undefined) {
+        log.error('NET', 'No decodable codec left to fall back to', { failed: [...failedDecoderCodecs], caps });
+        return false;
+    }
+    log.warn('NET', 'Decoder unavailable for codec, falling back', { from: failedCodecId, to: next });
+    applyCodec(next);
+    return true;
+};
+
 // --- Video helpers ---
 export const getMaxInFlightFrames = () => {
     const fps = Math.max(24, S.currentFps || S.hostFps || 60);

@@ -21,6 +21,10 @@ export const CODECS = {
 
 export const CODEC_KEYS = ['av1', 'h265', 'h264'];
 
+// Must match kProtocolVersion in include/host/core/protocol.hpp. The host rejects offers
+// from any other version with HTTP 426 so a stale page can't misread the stream.
+export const PROTOCOL_VERSION = 2;
+
 export const C = {
     HEADER: 55, AUDIO_HEADER: 24, PING_MS: 200, MAX_FRAMES: 64, FRAME_TIMEOUT_MS: 900,
     KEY_REQ_MIN_INTERVAL_MS: 350, KEY_RETRY_INTERVAL_MS: 700,

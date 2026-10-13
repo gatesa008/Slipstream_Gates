@@ -102,11 +102,13 @@ export const detectCodecs = async () => {
         }
     }
 
+    // Hardware decode of any codec ahead of software decode of a newer one.
     const best = sup.av1Hw  ? { codecId: 0, hardwareAccel: 1, codecName: 'AV1' }
-                : sup.av1   ? { codecId: 0, hardwareAccel: 0, codecName: 'AV1' }
                 : sup.h265Hw? { codecId: 1, hardwareAccel: 1, codecName: 'H.265' }
-                : sup.h265  ? { codecId: 1, hardwareAccel: 0, codecName: 'H.265' }
-                : { codecId: 2, hardwareAccel: sup.h264Hw, codecName: 'H.264' };
+                : sup.h264Hw? { codecId: 2, hardwareAccel: 1, codecName: 'H.264' }
+                : sup.h264  ? { codecId: 2, hardwareAccel: 0, codecName: 'H.264' }
+                : sup.av1   ? { codecId: 0, hardwareAccel: 0, codecName: 'AV1' }
+                : { codecId: 2, hardwareAccel: 0, codecName: 'H.264' };
 
     log.info('CODEC', 'Detection complete', { best: best.codecName, hw: best.hardwareAccel });
     codecCache = { support: sup, best };
@@ -126,7 +128,7 @@ const mkRender = () => zeroMetric('renderCount', 'renderTimeSum');
 const mkMic = () => zeroMetric('packetsSent', 'packetsDropped', 'encodeErrors', 'bytesSent');
 export const S = {
     pc: null, dcControl: null, dcVideo: null, dcAudio: null, dcInput: null, dcMic: null,
-    decoder: null, decoderCodec: null, ready: 0, needKey: 1, reinit: 0, hwAccel: 'unknown',
+    decoder: null, decoderCodec: null, decoderGeneration: null, lastDecodedFrameId: -1, ready: 0, needKey: 1, reinit: 0, hwAccel: 'unknown',
     W: 0, H: 0, hostFps: 60, currentFps: 60, currentFpsMode: 0, fpsSent: 0,
     authenticated: 0, monitors: [], currentMon: 0, tabbedMode: 0, username: null,
     audioCtx: null, audioEnabled: 0, audioDecoder: null, audioGain: null,

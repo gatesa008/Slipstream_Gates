@@ -24,12 +24,14 @@ class FrameSlot {
 public:
     FrameSlot();
     ~FrameSlot();
-    void SetGeneration(uint64_t g) { curGen.store(g, std::memory_order_release); }
+    // Single monotonic counter for every invalidation source (capture restarts, resizes, session
+    // resets). Separate counters used to collide on the same value and let stale frames through.
+    void BumpGeneration() { curGen.fetch_add(1, std::memory_order_acq_rel); }
     [[nodiscard]] uint64_t GetGeneration() const { return curGen.load(std::memory_order_acquire); }
     void Push(ID3D11Texture2D* tex, int64_t ts, int64_t sourceTs, uint64_t fence, bool sync, int idx = -1);
     bool Pop(FrameData& out);
     void Wake() { if (evt) SetEvent(evt); }
-    void MarkReleased(int i);
+    void MarkReleased(int i, uint64_t generation);
     [[nodiscard]] bool IsInFlight(int i);
     void Reset();
 };

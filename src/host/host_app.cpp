@@ -15,6 +15,7 @@
 #include <cstring>
 #include <cstdint>
 #include <cwchar>
+#include <optional>
 #include <thread>
 #include <utility>
 #include <winsock2.h>
@@ -85,6 +86,16 @@ std::pair<int, int> ResolveEncodeResolution(int sourceW, int sourceH, int client
     if (widthFromHeight <= clientW) targetW = std::max(2, widthFromHeight);
 
     return {std::max(2, targetW), std::max(2, targetH)};
+}
+
+// Codecs offered to the client. Hardware encoders only, when there are any: software AV1/HEVC
+// cannot hold real-time desktop rates, and advertising them is what made AV1 clients land on
+// libsvtav1 (or on nothing) on GPUs without an AV1 encoder. With no hardware encoder at all,
+// fall back to software H.264 (x264 ultrafast copes), else whatever the build has.
+uint8_t SelectAdvertisedCodecs(uint8_t hardwareCaps, uint8_t buildCaps) {
+    if (hardwareCaps) return hardwareCaps;
+    if (buildCaps & (1 << CODEC_H264)) return static_cast<uint8_t>(1 << CODEC_H264);
+    return buildCaps;
 }
 
 class WinsockSession {
@@ -404,6 +415,18 @@ void RegisterOfferRoute(httplib::SSLServer& server, const std::shared_ptr<WebRTC
                 return;
             }
 
+            const int clientProtocol = body.contains("protocolVersion") && body["protocolVersion"].is_number_integer()
+                ? body["protocolVersion"].get<int>() : 1;
+            if (clientProtocol != kProtocolVersion) {
+                WARN("Offer route: rejecting client protocol %d (host speaks %d)", clientProtocol, kProtocolVersion);
+                response.status = 426;
+                response.set_content(json{
+                    {"error", "This page is out of date for this host. Reload the page (Ctrl+F5) to update."},
+                    {"code", "protocol_mismatch"},
+                    {"protocolVersion", kProtocolVersion}}.dump(), "application/json");
+                return;
+            }
+
             std::string offer = body["sdp"];
             if (offer.empty() || offer.size() > 65536) {
                 JsonError(response, 400, "Invalid SDP");
@@ -425,7 +448,7 @@ void RegisterOfferRoute(httplib::SSLServer& server, const std::shared_ptr<WebRTC
                 answer.size(),
                 answer.find("typ relay") != std::string::npos ? 1 : 0,
                 answer.c_str());
-            response.set_content(json{{"sdp", answer}, {"type", "answer"}}.dump(), "application/json");
+            response.set_content(json{{"sdp", answer}, {"type", "answer"}, {"protocolVersion", kProtocolVersion}}.dump(), "application/json");
         } catch (...) {
             JsonError(response, 400, "Invalid offer");
         }
@@ -455,8 +478,8 @@ std::thread StartEncoderThread(
         int64_t nextTs = 0;
         uint64_t lastGeneration = frameSlot.GetGeneration();
 
-        auto freePending = [&] { frameSlot.MarkReleased(pendingFrame.poolIdx); pendingFrame.Release(); hasPendingFrame = false; };
-        auto freeCurrent = [&] { frameSlot.MarkReleased(currentFrame.poolIdx); currentFrame.Release(); };
+        auto freePending = [&] { frameSlot.MarkReleased(pendingFrame.poolIdx, pendingFrame.generation); pendingFrame.Release(); hasPendingFrame = false; };
+        auto freeCurrent = [&] { frameSlot.MarkReleased(currentFrame.poolIdx, currentFrame.generation); currentFrame.Release(); };
         auto promoteCurrent = [&] { pendingFrame = currentFrame; currentFrame = {}; hasPendingFrame = true; };
         auto loadTargetFps = [&] { int fps = targetFps.load(std::memory_order_acquire); return fps > 0 ? fps : 60; };
 
@@ -881,9 +904,11 @@ int RunHostApp(int argc, char* argv[]) {
 
         WiggleManager wiggle(app.running, input);
 
-        const uint8_t codecCaps = VideoEncoder::ProbeSupport(capture.GetDev());
-        const uint8_t hardwareCodecCaps = VideoEncoder::ProbeHardwareSupport(capture.GetDev());
-        LOG("Codec support: AV1=%d H265=%d H264=%d", (codecCaps & 1) ? 1 : 0, (codecCaps & 2) ? 1 : 0, (codecCaps & 4) ? 1 : 0);
+        const uint8_t buildCodecCaps = VideoEncoder::ProbeSupport(capture.GetDev());
+        const uint8_t hardwareCodecCaps = VideoEncoder::ProbeHardwareSupport(capture.GetDev(), capture.GetCtx(), capture.GetMT());
+        const uint8_t codecCaps = SelectAdvertisedCodecs(hardwareCodecCaps, buildCodecCaps);
+        LOG("Codec support: AV1=%d H265=%d H264=%d (advertised; hardware=0x%X, build=0x%X)",
+            (codecCaps & 1) ? 1 : 0, (codecCaps & 2) ? 1 : 0, (codecCaps & 4) ? 1 : 0, hardwareCodecCaps, buildCodecCaps);
 
         std::unique_ptr<AudioCapture> audioCapture;
         try { audioCapture = std::make_unique<AudioCapture>(); } catch (...) { WARN("AudioCapture init failed"); }
@@ -898,6 +923,8 @@ int RunHostApp(int argc, char* argv[]) {
         // Serializes encoder construction. Never held together with encoderMutex while building,
         // so the encoder thread keeps encoding with the old encoder until the swap.
         std::mutex encoderBuildMutex;
+        // Stamped into every frame (mod 8) so the client can tell encoder instances apart.
+        uint8_t nextEncoderGeneration = 0;
 
         auto updateEncoderInfo = [&](CodecType codec, const VideoEncoder* activeEncoder) {
             const bool usingHardware = activeEncoder && activeEncoder->IsUsingHardware();
@@ -922,8 +949,9 @@ int RunHostApp(int argc, char* argv[]) {
                 codec);
         };
 
-        // Caller holds encoderMutex.
+        // Caller holds encoderBuildMutex and encoderMutex (in that order).
         auto installEncoderLocked = [&](std::unique_ptr<VideoEncoder>& next) {
+            next->SetGeneration(static_cast<uint8_t>(++nextEncoderGeneration & 0x7));
             std::unique_ptr<VideoEncoder> previous = std::move(encoder);
             encoder = std::move(next);
             encoder->UpdateFPS(targetFps.load(std::memory_order_acquire));
@@ -943,9 +971,33 @@ int RunHostApp(int argc, char* argv[]) {
 
         // Builds the replacement before touching the live encoder. On failure the current encoder
         // (if any) keeps running, so a bad codec or size request never leaves the stream dead.
-        auto rebuildEncoder = [&](int width, int height, int fps, CodecType codec) -> bool {
+        // Codec, FPS and size are resolved *after* taking the build lock: a rebuild queued behind
+        // another one (e.g. a resize waiting on a codec change) must build what is current now,
+        // not what was current when it was requested.
+        //   codecOverride: codec to switch to, or nullopt to keep the current one.
+        //   onlyIfChanged: skip when the resolved size and codec already match the live encoder.
+        auto rebuildEncoder = [&](std::optional<CodecType> codecOverride, bool onlyIfChanged, const char* reason) -> bool {
             std::lock_guard<std::mutex> buildLock(encoderBuildMutex);
             const uint64_t epoch = streamEpoch.load(std::memory_order_acquire);
+            if (!encoderReady.load(std::memory_order_acquire)) return false;
+
+            const CodecType codec = codecOverride.value_or(currentCodec.load(std::memory_order_acquire));
+            const int fps = targetFps.load(std::memory_order_acquire);
+            const auto [width, height] = resolveEncodeTarget();
+            if (width <= 0 || height <= 0) {
+                ERR("Invalid encode target size resolved for %s", reason);
+                return false;
+            }
+            const int previousWidth = encodeTargetWidth.load(std::memory_order_acquire);
+            const int previousHeight = encodeTargetHeight.load(std::memory_order_acquire);
+            if (onlyIfChanged && width == previousWidth && height == previousHeight &&
+                codec == currentCodec.load(std::memory_order_acquire)) {
+                return true;
+            }
+            LOG("Encoder rebuild (%s): %dx%d %s -> %dx%d %s (source=%dx%d, client=%dx%d)",
+                reason, previousWidth, previousHeight, VideoEncoder::CodecName(currentCodec.load(std::memory_order_acquire)),
+                width, height, VideoEncoder::CodecName(codec), capture.GetW(), capture.GetH(),
+                clientTargetWidth.load(std::memory_order_acquire), clientTargetHeight.load(std::memory_order_acquire));
 
             std::unique_ptr<VideoEncoder> next;
             try {
@@ -958,7 +1010,7 @@ int RunHostApp(int argc, char* argv[]) {
             std::unique_ptr<VideoEncoder> previous;
             {
                 std::lock_guard<std::mutex> lock(encoderMutex);
-                if (epoch != streamEpoch.load(std::memory_order_acquire)) {
+                if (epoch != streamEpoch.load(std::memory_order_acquire) || !encoderReady.load(std::memory_order_acquire)) {
                     DBG("Encoder rebuild discarded: streaming state reset while building");
                     return false;
                 }
@@ -971,40 +1023,11 @@ int RunHostApp(int argc, char* argv[]) {
             return true;
         };
 
-        auto rebuildResolvedEncoder = [&](int fps, CodecType codec, const char* reason) -> bool {
-            const auto [targetWidth, targetHeight] = resolveEncodeTarget();
-            if (targetWidth <= 0 || targetHeight <= 0) {
-                ERR("Invalid encode target size resolved for %s", reason ? reason : "unknown");
-                return false;
-            }
-
-            const int previousWidth = encodeTargetWidth.load(std::memory_order_acquire);
-            const int previousHeight = encodeTargetHeight.load(std::memory_order_acquire);
-            if (targetWidth != previousWidth || targetHeight != previousHeight) {
-                LOG("Encode target: %s -> %dx%d (source=%dx%d, client=%dx%d)",
-                    reason ? reason : "update",
-                    targetWidth,
-                    targetHeight,
-                    capture.GetW(),
-                    capture.GetH(),
-                    clientTargetWidth.load(std::memory_order_acquire),
-                    clientTargetHeight.load(std::memory_order_acquire));
-            }
-
-            return rebuildEncoder(targetWidth, targetHeight, fps, codec);
-        };
-
-        // Size-driven rebuilds (client viewport, host display mode). Skipped when there is no live
-        // encoder yet (onFpsChange creates it at the resolved size) or the target is unchanged;
-        // the encoder's GPU scaler covers any source/encode size mismatch in the meantime.
+        // Size-driven rebuilds (client viewport, host display mode). No-ops when there is no live
+        // encoder yet (onFpsChange creates it at the resolved size) or nothing changed; the
+        // encoder's GPU scaler covers any source/encode size mismatch in the meantime.
         EncoderRebuildWorker rebuildWorker([&](const char* reason) {
-            if (!encoderReady.load(std::memory_order_acquire)) return;
-            const auto [targetWidth, targetHeight] = resolveEncodeTarget();
-            if (targetWidth == encodeTargetWidth.load(std::memory_order_acquire) &&
-                targetHeight == encodeTargetHeight.load(std::memory_order_acquire)) {
-                return;
-            }
-            rebuildResolvedEncoder(capture.GetCurrentFPS(), currentCodec.load(std::memory_order_acquire), reason);
+            rebuildEncoder(std::nullopt, true, reason);
         });
 
         capture.SetResolutionChangeCallback([&](int width, int height, int fps) {
@@ -1035,7 +1058,7 @@ int RunHostApp(int argc, char* argv[]) {
             if (audioCapture) audioCapture->SetStreaming(false);
             if (micPlayback) micPlayback->SetStreaming(false);
             if (resetFrameSlot) {
-                frameSlot.SetGeneration(frameSlot.GetGeneration() + 1);
+                frameSlot.BumpGeneration();
                 frameSlot.Reset();
                 wiggle.Request();
             }
@@ -1048,6 +1071,7 @@ int RunHostApp(int argc, char* argv[]) {
                 capture.SetFPS(fps);
                 targetFps.store(fps, std::memory_order_release);
                 lastEncodeTs.store(0, std::memory_order_release);
+                std::lock_guard<std::mutex> buildLock(encoderBuildMutex);
                 std::lock_guard<std::mutex> lock(encoderMutex);
                 if (encoder) {
                     encoder->UpdateFPS(fps);
@@ -1093,7 +1117,7 @@ int RunHostApp(int argc, char* argv[]) {
                     return true;
                 }
                 // On failure the previous encoder is still installed, and the ACK carries the old codec.
-                return rebuildResolvedEncoder(capture.GetCurrentFPS(), codec, "codec-change");
+                return rebuildEncoder(codec, false, "codec-change");
             };
         callbacks.getCodec = [&] { return currentCodec.load(std::memory_order_acquire); };
         callbacks.getCodecCaps = [&] { return codecCaps; };

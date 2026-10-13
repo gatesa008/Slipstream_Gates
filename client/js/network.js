@@ -1,12 +1,12 @@
 
 import { enableControl, disableControl } from './input.js';
-import { MSG, C } from './constants.js';
+import { MSG, C, PROTOCOL_VERSION } from './constants.js';
 import { S, $, safe, updateClockOffset, resetClockSync,
     startMetricsLogger, stopMetricsLogger, resetSessionStats, recordPacket,
     clientTimeUs, logVideoDrop, logAudioDrop, logNetworkDrop, log, bus } from './state.js';
 import { handleAudioPacket, closeAudio, initDecoder, decodeFrame, stopKeyframeRetry, resetVideoDecoderState } from './media.js';
 import { updateMonOpts, updateCodecOpts, updateCodecDropdown, setHostCodecs,
-    updateLoadingStage, showLoading, hideLoading, getStoredCodec, initCodecDetection,
+    updateLoadingStage, showLoading, hideLoading, initCodecDetection,
     getStoredFps, updateFpsDropdown, closeTabbedMode, setSecureDesktopNotice } from './ui.js';
 import { resetRenderer, setCursorStyle } from './renderer.js';
 import { stopMic } from './mic.js';
@@ -48,6 +48,8 @@ const AUDIO_RESYNC_DISTANCE = 200;
 const heldAudioPackets = new Map();
 let audioNextPacketId = null;
 let audioReorderTimer = null;
+let audioConsecutiveLate = 0;
+const AUDIO_LATE_RESYNC = 10;  // a run of "late" packets means the host restarted its counter
 
 const hasPublicIceCandidate = sdp => sdp.includes(' typ srflx') || sdp.includes(' typ relay');
 
@@ -105,6 +107,7 @@ const rememberAndDeliverAudioPacket = (packetId, packet) => {
 const resetAudioReorder = () => {
     heldAudioPackets.clear();
     audioNextPacketId = null;
+    audioConsecutiveLate = 0;
     audioReorderTimer = clearTimer(audioReorderTimer, clearTimeout);
 };
 
@@ -135,15 +138,19 @@ const flushHeldAudio = now => {
 };
 
 const enqueueOrderedAudio = (packetId, packet) => {
-    if (audioNextPacketId === null || Math.abs(packetId - audioNextPacketId) > AUDIO_RESYNC_DISTANCE) {
+    if (audioNextPacketId === null || Math.abs(packetId - audioNextPacketId) > AUDIO_RESYNC_DISTANCE ||
+        (packetId < audioNextPacketId && audioConsecutiveLate >= AUDIO_LATE_RESYNC)) {
         // First packet, or the host restarted its counter: start fresh from here.
         heldAudioPackets.clear();
         audioNextPacketId = packetId;
+        audioConsecutiveLate = 0;
     }
     if (packetId < audioNextPacketId) {
+        audioConsecutiveLate++;
         logAudioDrop('Late packet', { packetId, expected: audioNextPacketId });
         return;
     }
+    audioConsecutiveLate = 0;
     heldAudioPackets.set(packetId, { packet, at: performance.now() });
     flushHeldAudio(performance.now());
 };
@@ -419,9 +426,20 @@ const processFrame = (frameId, frame) => {
         assemblyMs: assemblyMs.toFixed(1)
     });
 
+    // Frames can complete out of order on the unordered channel (FEC recovery, late chunks).
+    // Feeding an older frame after a newer one corrupts the reference chain, and after an
+    // encoder rebuild it would hand the decoder a frame from the previous encoder.
+    if (frameId <= S.lastDecodedFrameId) {
+        logVideoDrop('Stale frame (completed out of order)', { frameId, lastDecoded: S.lastDecodedFrameId, isKey: frame.isKey ? 1 : 0 });
+        S.chunks.delete(frameId);
+        return;
+    }
+
     const decodeAccepted = decodeFrame({
         buf: buffer,
+        frameId,
         codec: frame.codec,
+        generation: frame.generation,
         capTs: frame.capTs,
         sourceTs: frame.sourceTs,
         encodeEndTs: frame.encodeEndTs,
@@ -478,8 +496,8 @@ const handleControl = async e => {
     }
     if (msgType === MSG.CODEC_CAPS && length === 5) {
         setHostCodecs(view.getUint8(4));
-        await updateCodecOpts();
-        if (!S.codecSent) applyCodec(2); // TEMP: force H.264
+        const chosenCodec = await updateCodecOpts();
+        if (!S.codecSent) applyCodec(chosenCodec);
         log.info('NET', 'Codec caps', { caps: view.getUint8(4).toString(2) });
         return recordPacket(length, 'control');
     }
@@ -563,11 +581,12 @@ const handleVideo = e => {
     const totalChunks = view.getUint16(46, true);
     const chunkBytes = view.getUint16(48, true);
     const dataChunkSize = view.getUint16(50, true);
-    // frameType: bit 0 = keyframe, bits 4-6 = codec + 1 (0 on hosts that don't tag frames).
+    // frameType: bit 0 = keyframe, bits 1-3 = encoder generation, bits 4-6 = codec + 1.
     const frameType = view.getUint8(52);
     const isKey = (frameType & 1) === 1;
     const codecTag = (frameType >> 4) & 0x7;
     const frameCodec = codecTag ? codecTag - 1 : null;
+    const frameGeneration = codecTag ? (frameType >> 1) & 0x7 : null;
     const packetType = view.getUint8(53);
     const fecGroupSize = view.getUint8(54) || C.FEC_GROUP_SIZE;
 
@@ -621,6 +640,7 @@ const handleVideo = e => {
                 enqueueTs,
                 isKey,
                 codec: frameCodec,
+                generation: frameGeneration,
                 fecGroupSize: Math.max(1, fecGroupSize)
             }, chunkIndex, chunkData, arrivalMs);
             return;
@@ -632,7 +652,7 @@ const handleVideo = e => {
             sourceTs,
             encodeEndTs,
             enqueueTs,
-            encMs: view.getUint32(32, true) / 1000, arrivalMs, lastPacketMs: arrivalMs, isKey, codec: frameCodec,
+            encMs: view.getUint32(32, true) / 1000, arrivalMs, lastPacketMs: arrivalMs, isKey, codec: frameCodec, generation: frameGeneration,
             frameSize, dataChunkSize, fecGroupSize: Math.max(1, fecGroupSize),
             fecParts: new Map(), fecRecovered: 0
         });
@@ -821,6 +841,7 @@ const resetState = () => {
     resetProtocolState();
     S.chunks.clear();
     S.lastFrameId = 0;
+    S.lastDecodedFrameId = -1;
     S.frameMeta.clear();
     lastChunkCleanupAt = 0;
     lastAudioFecCleanupAt = 0;
@@ -934,7 +955,7 @@ const connect = async (serverBusyRetry = 0) => {
         res = await fetch(`${BASE_URL}/api/offer`, {
             method: 'POST', headers: { 'Content-Type': 'application/json' },
             credentials: 'include', signal: attemptAbort.signal,
-            body: JSON.stringify({ sdp: pc.localDescription.sdp, type: pc.localDescription.type })
+            body: JSON.stringify({ sdp: pc.localDescription.sdp, type: pc.localDescription.type, protocolVersion: PROTOCOL_VERSION })
         });
     } finally { clearTimeout(offerTimeout); }
     ensureActive();
@@ -943,6 +964,15 @@ const connect = async (serverBusyRetry = 0) => {
         let data = {};
         try { data = await res.json(); } catch (e) { log.debug('NET', 'Failed to parse error response body', { status: res.status, error: e?.message }); }
         if (res.status === 401) { clearSession(); showAuth('Session expired.'); return; }
+        if (res.status === 426) {
+            // Host and page disagree on the wire format. Retrying can't help; a reload fetches
+            // the client that matches the host.
+            log.error('NET', 'Protocol mismatch', { client: PROTOCOL_VERSION, host: data.protocolVersion });
+            cleanup();
+            closeTabbedMode();
+            showAuth(data.error || 'This page is out of date. Reload the page to update.');
+            return;
+        }
         if (res.status === 503) {
             if (serverBusyRetry >= MAX_SERVER_BUSY_RETRIES) {
                 throw new Error('Server is busy processing another offer. Please wait a moment and retry.');

@@ -161,6 +161,13 @@ export const initCodecDetection = async () => {
     }
 };
 
+// Hardware decode beats a "better" codec decoded in software (e.g. dav1d at 4K60).
+const codecPriority = support => {
+    const hw = [0, 1, 2].filter(id => support[CODEC_KEYS[id] + 'Hw']);
+    const sw = [2, 0, 1].filter(id => support[CODEC_KEYS[id]] && !hw.includes(id));
+    return [...hw, ...sw];
+};
+
 export const updateCodecOpts = async () => {
     const { support } = await detectCodecs();
     const hostCaps = S.hostCodecs;
@@ -174,20 +181,16 @@ export const updateCodecOpts = async () => {
         ? supportedCodecs.map(codec => `<option value="${codec.id}">${codec.name}</option>`).join('')
         : '<option value="2">H.264</option>';
 
+    // A saved choice wins when both ends still support it; otherwise take the best codec both
+    // sides can do (hardware decode first, see detectCodecs), and H.264 as the last resort.
+    const usable = id => support[CODEC_KEYS[id]] && (hostCaps & (1 << id));
     const storedCodec = loadPref(STORAGE_KEYS.CODEC, v => v >= 0 && v <= 2, null);
-    const preferred = storedCodec ?? defaultCodec ?? 0;
-    const canUse = support[CODEC_KEYS[preferred]] && (hostCaps & (1 << preferred));
-
-    if (canUse) {
-        codecSel.value = preferred;
-    } else {
-        const fallback = [0, 1, 2].find(id => support[CODEC_KEYS[id]] && (hostCaps & (1 << id)));
-        codecSel.value = fallback ?? 2;
-        log.warn('UI', 'Preferred codec unavailable, using fallback', { preferred, fallback });
+    const chosen = [storedCodec, ...codecPriority(support)].find(id => id !== null && usable(id)) ?? 2;
+    if (storedCodec !== null && chosen !== storedCodec) {
+        log.warn('UI', 'Saved codec unavailable, using fallback', { saved: storedCodec, chosen });
     }
-
-    codecSel.value = 2;
-    S.currentCodec = 2; // TEMP: force H.264
+    codecSel.value = chosen;
+    return chosen;
 };
 
 bindNumericSelect(codecSel, applyCodec, 'Codec changed', STORAGE_KEYS.CODEC, 'codec');

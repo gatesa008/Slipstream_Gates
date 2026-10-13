@@ -89,9 +89,12 @@ bool FrameSlot::Pop(FrameData& out) {
     return true;
 }
 
-void FrameSlot::MarkReleased(int i) {
+void FrameSlot::MarkReleased(int i, uint64_t generation) {
     if (i < 0) return;
     EnterCriticalSection(&cs);
+    // After a Reset (resize, monitor switch) the pool index may already belong to a newer frame;
+    // clearing its bit would let capture overwrite a texture that is still queued for encode.
+    if (generation != curGen.load(std::memory_order_acquire)) { LeaveCriticalSection(&cs); return; }
     inFlight &= ~(1u << i);
     LeaveCriticalSection(&cs);
 }
@@ -225,7 +228,7 @@ bool ScreenCapture::ResizeCaptureTargets(int newW, int newH) {
     }
 
     // Invalidate queued frames first; in-flight frames hold their own texture refs.
-    slot->SetGeneration(captureGen.fetch_add(1) + 1);
+    captureGen.fetch_add(1); slot->BumpGeneration();
     slot->Reset();
     for (int i = 0; i < POOL; i++) {
         SafeRelease(texPool[i]);
@@ -282,7 +285,7 @@ void ScreenCapture::InitMon(HMONITOR mon, bool keepFps) {
 
     started = false;
     curMon = mon;
-    slot->SetGeneration(captureGen.fetch_add(1) + 1);
+    captureGen.fetch_add(1); slot->BumpGeneration();
 }
 
 bool ScreenCapture::ReinitializeMonitor() {
@@ -311,7 +314,7 @@ bool ScreenCapture::ReinitializeMonitor() {
         std::lock_guard<std::recursive_mutex> lk(mtx);
 
         capturing = false;
-        slot->SetGeneration(captureGen.fetch_add(1) + 1);
+        captureGen.fetch_add(1); slot->BumpGeneration();
         slot->Wake();
 
         try { if (sess) sess.Close(); }
@@ -403,7 +406,7 @@ ScreenCapture::~ScreenCapture() {
 void ScreenCapture::Shutdown() {
     running = false;
     capturing = false;
-    slot->SetGeneration(captureGen.fetch_add(1) + 1);
+    captureGen.fetch_add(1); slot->BumpGeneration();
     slot->Wake();
 
     {
@@ -451,7 +454,7 @@ void ScreenCapture::StartCapture() {
 void ScreenCapture::PauseCapture() {
     std::lock_guard<std::recursive_mutex> lk(mtx);
     if (!capturing.exchange(false)) return;
-    slot->SetGeneration(captureGen.fetch_add(1) + 1);
+    captureGen.fetch_add(1); slot->BumpGeneration();
     slot->Reset();
     LOG("ScreenCapture: Capture paused");
 }
@@ -471,7 +474,7 @@ bool ScreenCapture::SwitchMonitor(int i) {
         std::lock_guard<std::recursive_mutex> lk(mtx);
         was = capturing.load();
         capturing = false;
-        slot->SetGeneration(captureGen.fetch_add(1) + 1);
+        captureGen.fetch_add(1); slot->BumpGeneration();
         slot->Wake();
 
         try { if (sess) sess.Close(); } catch (...) { DBG("Capture: SwitchMonitor sess.Close exception"); }

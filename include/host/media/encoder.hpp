@@ -10,6 +10,7 @@ struct EncodedFrame {
     int64_t ts=0, sourceTs=0, encodeEndTs=0, enqueueTs=0, encUs=0;
     bool isKey=false;
     CodecType codec=CODEC_H264;
+    uint8_t generation=0;
     void Clear() { data.clear(); ts = sourceTs = encodeEndTs = enqueueTs = encUs = 0; isKey = false; }
 };
 
@@ -38,6 +39,7 @@ class VideoEncoder {
     D3D11FenceSync sync;
     int w, h, frameNum=0, curFps;
     CodecType codec;
+    uint8_t generation=0;
     GPUVendor vendor=GPUVendor::UNKNOWN;
     AVPixelFormat swPixFmt=AV_PIX_FMT_NONE;
     bool usingHardware=false;
@@ -71,18 +73,19 @@ class VideoEncoder {
 
 public:
     [[nodiscard]] static uint8_t ProbeSupport(ID3D11Device* d);
-    [[nodiscard]] static uint8_t ProbeHardwareSupport(ID3D11Device* d);
+    [[nodiscard]] static uint8_t ProbeHardwareSupport(ID3D11Device* d, ID3D11DeviceContext* c, ID3D11Multithread* m);
     [[nodiscard]] static GPUVendor DetectGPU(ID3D11Device* d);
     [[nodiscard]] static const char* VendorName(GPUVendor v);
     [[nodiscard]] static const char* CodecName(CodecType c);
 
     VideoEncoder(int w, int h, int fps, ID3D11Device* d, ID3D11DeviceContext* c,
-                 ID3D11Multithread* m, CodecType cc=CODEC_AV1);
+                 ID3D11Multithread* m, CodecType cc=CODEC_AV1, bool allowSoftware=true);
     ~VideoEncoder();
 
     [[nodiscard]] GPUVendor GetVendor() const { return vendor; }
     [[nodiscard]] bool IsUsingHardware() const { return usingHardware; }
     [[nodiscard]] CodecType GetCodec() const { return codec; }
+    void SetGeneration(uint8_t g) { generation = g; }
     [[nodiscard]] int GetWidth() const { return w; }
     [[nodiscard]] int GetHeight() const { return h; }
     [[nodiscard]] const std::string& GetActiveEncoderName() const { return activeEncoderName; }

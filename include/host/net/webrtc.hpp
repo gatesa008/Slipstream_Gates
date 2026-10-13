@@ -83,6 +83,22 @@ class WebRTCServer {
     std::atomic<uint64_t> ctrlSent{0}, ctrlRecv{0}, inputRecv{0}, micRecv{0}, connCount{0};
     std::atomic<uint64_t> peerEpoch{0};
     std::atomic<bool> videoDrainActive_{false}, audioDrainActive_{false};
+    std::atomic<bool> stopping_{false};
+    std::atomic<int> callbacksInFlight_{0};
+
+    // Counts a libdatachannel/HTTP entry point that may reach host callbacks. Count first, then
+    // check stopping_, so Shutdown() never misses a callback that slipped past the check.
+    struct CallbackGuard {
+        WebRTCServer& server;
+        bool active;
+        explicit CallbackGuard(WebRTCServer& s) : server(s) {
+            server.callbacksInFlight_.fetch_add(1, std::memory_order_acq_rel);
+            active = !server.stopping_.load(std::memory_order_acquire);
+        }
+        ~CallbackGuard() { server.callbacksInFlight_.fetch_sub(1, std::memory_order_acq_rel); }
+        CallbackGuard(const CallbackGuard&) = delete;
+        CallbackGuard& operator=(const CallbackGuard&) = delete;
+    };
 
     bool SendCtrl(const void* d, size_t len);
     void SendHostInfo();

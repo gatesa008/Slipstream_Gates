@@ -17,11 +17,23 @@ enum MsgType : uint32_t {
 enum CodecType : uint8_t { CODEC_AV1=0, CODEC_H265=1, CODEC_H264=2 };
 enum PacketType : uint8_t { PKT_DATA=0, PKT_FEC=1 };
 
-// Video PacketHeader::frameType layout: bit 0 = keyframe, bits 4-6 = codec + 1 (0 = untagged).
+// Wire protocol revision. Bump on any change an older client would misread; /api/offer rejects
+// clients that don't send the matching value. History: 1 = untagged frameType (0/1),
+// 2 = codec + encoder-generation tags in frameType.
+constexpr int kProtocolVersion = 2;
+
+// Video PacketHeader::frameType layout:
+//   bit 0    keyframe
+//   bits 1-3 encoder generation (mod 8): changes whenever a new encoder instance is installed,
+//            so the client can tell a new encoder's frames from the old one's even with one codec
+//   bits 4-6 codec + 1 (0 = untagged)
 constexpr uint8_t kFrameTypeKeyBit = 0x01;
+constexpr uint8_t kFrameTypeGenerationShift = 1;
 constexpr uint8_t kFrameTypeCodecShift = 4;
-constexpr uint8_t MakeVideoFrameType(bool isKey, CodecType codec) {
-    return static_cast<uint8_t>((isKey ? kFrameTypeKeyBit : 0) | ((static_cast<uint8_t>(codec) + 1) << kFrameTypeCodecShift));
+constexpr uint8_t MakeVideoFrameType(bool isKey, CodecType codec, uint8_t generation) {
+    return static_cast<uint8_t>((isKey ? kFrameTypeKeyBit : 0) |
+        ((generation & 0x7) << kFrameTypeGenerationShift) |
+        ((static_cast<uint8_t>(codec) + 1) << kFrameTypeCodecShift));
 }
 
 // MSG_DESKTOP_STATE payload byte.
