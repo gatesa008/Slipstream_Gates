@@ -52,5 +52,14 @@ inline int64_t GetTimestamp() {
     }();
     LARGE_INTEGER counter{};
     QueryPerformanceCounter(&counter);
-    return static_cast<int64_t>((counter.QuadPart * 1000000LL) / frequency);
+    // Split into whole seconds + remainder so the intermediate product can't overflow. The old
+    // `counter.QuadPart * 1000000` overflows int64 after ~10.6 days of uptime at a 10 MHz QPC,
+    // wrapping the timestamp negative; the client reads it as unsigned (~1.84e19) and every frame
+    // is rejected by EncodedVideoChunk. A process restart does not help because QPC counts from
+    // system boot. `whole * 1000000` is safe for ~292000 years; `rem < frequency` keeps the
+    // fractional product well inside int64.
+    const int64_t ticks = counter.QuadPart;
+    const int64_t whole = ticks / frequency;
+    const int64_t rem = ticks % frequency;
+    return whole * 1000000LL + (rem * 1000000LL) / frequency;
 }
