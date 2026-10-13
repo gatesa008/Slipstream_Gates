@@ -69,6 +69,9 @@ const tryReinitDecoder = () => {
         }, 100);
     }
 };
+// Max frames allowed in the WebCodecs decode submission queue before deltas are dropped for
+// freshness. Kept low because queue depth is latency; a healthy client rarely exceeds 1.
+const DECODE_QUEUE_DROP_THRESHOLD = 4;
 const CODEC_MAP = Object.fromEntries(Object.values(CODECS).map(c => [c.id, c.codec]));
 
 // Supported decoder configs per codec string, so a mid-stream codec switch can configure
@@ -271,8 +274,13 @@ export const decodeFrame = data => {
         return false;
     }
 
+    // Drop a delta rather than let decode fall further behind. A deep submission queue is pure
+    // latency: every queued frame must decode before the newest one reaches the screen. A capable
+    // client sits at 0-1 so this never fires; a client that can't keep up sheds load (and triggers
+    // a recovery keyframe via notifyDecodeQueuePressure) sooner instead of accumulating ~100 ms of
+    // backlog. Keyframes are never dropped here.
     const queueSize = S.decoder.decodeQueueSize || 0;
-    if (queueSize > 6 && !data.isKey) {
+    if (queueSize > DECODE_QUEUE_DROP_THRESHOLD && !data.isKey) {
         logVideoDrop('Decode queue full', {
             queueSize, isKey: data.isKey ? 1 : 0, capTs: data.capTs
         });
